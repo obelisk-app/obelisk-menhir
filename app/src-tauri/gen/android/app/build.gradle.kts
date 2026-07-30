@@ -13,11 +13,36 @@ val tauriProperties = Properties().apply {
     }
 }
 
+// Written by scripts/build-android.sh; absent on machines without the signing
+// key, in which case release builds stay unsigned rather than failing.
+val keystoreProperties = Properties().apply {
+    val propFile = rootProject.file("keystore.properties")
+    if (propFile.exists()) {
+        propFile.inputStream().use { load(it) }
+    }
+}
+
 android {
     compileSdk = 36
     namespace = "ar.obelisk.menhir"
+
+    if (keystoreProperties.containsKey("storeFile")) {
+        signingConfigs {
+            create("release") {
+                keyAlias = keystoreProperties["keyAlias"] as String
+                keyPassword = keystoreProperties["password"] as String
+                storeFile = file(keystoreProperties["storeFile"] as String)
+                storePassword = keystoreProperties["password"] as String
+            }
+        }
+    }
+
     defaultConfig {
-        manifestPlaceholders["usesCleartextTraffic"] = "false"
+        // Menhir servers are self-hosted: typically plain ws:// on a LAN or
+        // behind Tor (which encrypts end to end). Blocking cleartext would
+        // make the app useless for its own use case. See
+        // docs/known-limitations.md for the tradeoff.
+        manifestPlaceholders["usesCleartextTraffic"] = "true"
         applicationId = "ar.obelisk.menhir"
         minSdk = 24
         targetSdk = 36
@@ -37,6 +62,9 @@ android {
             }
         }
         getByName("release") {
+            if (keystoreProperties.containsKey("storeFile")) {
+                signingConfig = signingConfigs.getByName("release")
+            }
             isMinifyEnabled = true
             proguardFiles(
                 *fileTree(".") { include("**/*.pro") }
