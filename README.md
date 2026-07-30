@@ -70,7 +70,7 @@ menhir admin invite-create --max-uses 1
 menhir admin whitelist-add npub1…
 ```
 
-Every read command takes `--json`; streams emit NDJSON — pipe straight into an agent.
+Every read command takes `--json`; streams emit NDJSON — pipe straight into an agent. See [docs/AGENTS.md](docs/AGENTS.md) for the full agent-facing contract, including a watch-and-reply loop.
 
 ## Building from source
 
