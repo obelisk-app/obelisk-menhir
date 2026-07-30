@@ -84,6 +84,49 @@ EOF
   echo "NOTE: keep $KEYSTORE safe — Android updates must be signed with the same key."
 fi
 
+# ---- aapt2 sanity check ----
+# A distro-packaged aapt2 (e.g. Debian's) can be too old to read a recent
+# platform's android.jar. Gradle prefers $GRADLE_USER_HOME/gradle.properties
+# over the project's and the tauri CLI forwards `--` args to cargo, not
+# Gradle — so when the configured aapt2 is stale, build under a private
+# GRADLE_USER_HOME that overrides it. Caches are symlinked, so nothing is
+# re-downloaded and the user's own Gradle config is left untouched.
+USER_GRADLE_HOME="${GRADLE_USER_HOME:-$HOME/.gradle}"
+COMPILE_SDK="$(grep -oP 'compileSdk\s*=\s*\K[0-9]+' gen/android/app/build.gradle.kts 2>/dev/null | head -1 || echo 36)"
+PLATFORM_JAR="$ANDROID_HOME/platforms/android-$COMPILE_SDK/android.jar"
+CONFIGURED_AAPT2="$(grep -hoP 'android\.aapt2FromMavenOverride\s*=\s*\K.*' \
+  "$USER_GRADLE_HOME/gradle.properties" gen/android/gradle.properties 2>/dev/null | head -1 || true)"
+
+aapt2_can_link() {
+  local aapt2="$1" probe rc=1
+  probe="$(mktemp -d)"
+  mkdir -p "$probe/res/values"
+  printf '<?xml version="1.0" encoding="utf-8"?>\n<resources><string name="probe">x</string></resources>\n' > "$probe/res/values/strings.xml"
+  printf '<?xml version="1.0" encoding="utf-8"?>\n<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="probe.pkg"><application/></manifest>\n' > "$probe/AndroidManifest.xml"
+  if "$aapt2" compile --dir "$probe/res" -o "$probe/o.flata" >/dev/null 2>&1 &&
+     "$aapt2" link -I "$PLATFORM_JAR" --manifest "$probe/AndroidManifest.xml" -o "$probe/o.apk" "$probe/o.flata" >/dev/null 2>&1; then
+    rc=0
+  fi
+  rm -rf "$probe"
+  return $rc
+}
+
+if [[ -n "$CONFIGURED_AAPT2" && -f "$PLATFORM_JAR" ]] && ! aapt2_can_link "$CONFIGURED_AAPT2"; then
+  SDK_AAPT2="$(ls "$ANDROID_HOME"/build-tools/*/aapt2 2>/dev/null | sort -V | tail -1)"
+  echo "WARNING: $CONFIGURED_AAPT2 cannot link against android-$COMPILE_SDK"
+  echo "         building with $SDK_AAPT2 under a private GRADLE_USER_HOME"
+  PRIVATE_GRADLE_HOME="$REPO_ROOT/app/src-tauri/gen/.gradle-home"
+  mkdir -p "$PRIVATE_GRADLE_HOME"
+  for shared in caches wrapper native; do
+    [[ -e "$USER_GRADLE_HOME/$shared" && ! -e "$PRIVATE_GRADLE_HOME/$shared" ]] &&
+      ln -s "$USER_GRADLE_HOME/$shared" "$PRIVATE_GRADLE_HOME/$shared"
+  done
+  grep -v 'android\.aapt2FromMavenOverride' "$USER_GRADLE_HOME/gradle.properties" 2>/dev/null \
+    > "$PRIVATE_GRADLE_HOME/gradle.properties" || true
+  echo "android.aapt2FromMavenOverride=$SDK_AAPT2" >> "$PRIVATE_GRADLE_HOME/gradle.properties"
+  export GRADLE_USER_HOME="$PRIVATE_GRADLE_HOME"
+fi
+
 # ---- build ----
 if [[ "$MODE" == "release" ]]; then
   cargo tauri android build --apk --target aarch64

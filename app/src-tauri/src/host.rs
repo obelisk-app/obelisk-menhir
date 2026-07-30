@@ -135,12 +135,9 @@ pub async fn host_start(
                 inner.onion = th.onion.clone();
                 inner.tor = Some(th);
             }
-            Err(e) => {
-                // Relay stays up local-only; surface the Tor failure.
-                let status = status_of(&inner, &dir);
-                let _ = status;
-                return Err(format!("relay started locally, but Tor failed: {e}"));
-            }
+            // The relay stays up local-only; surface the Tor failure so the
+            // user knows the server is not reachable from outside.
+            Err(e) => return Err(format!("relay started locally, but Tor failed: {e}")),
         }
     }
     Ok(status_of(&inner, &dir))
