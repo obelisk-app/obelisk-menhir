@@ -59,6 +59,14 @@ what separates this proof of concept from the "definition of done" there.
   by design; onion connections need the desktop app's Tor. An Android user
   can only join clearnet relays (`ws://`, `wss://`). Next: bundle a Tor
   library (e.g. arti) into the mobile build.
+- **The Android build allows cleartext traffic.** Self-hosted relays are
+  typically plain `ws://` on a LAN or behind Tor, so blocking cleartext (the
+  Tauri default for release builds) would make the app useless for its own
+  use case. The tradeoff: a `ws://` connection over a hostile network is
+  readable and tamperable — the relay's NIP-42 challenge and event signatures
+  still prevent impersonation, but not eavesdropping. Prefer `wss://` for
+  clearnet servers. Set in
+  `app/src-tauri/gen/android/app/build.gradle.kts`.
 - **One relay at a time.** Switching servers tears down the connection and
   rebuilds channel state. This is intentional — it is what keeps events from
   different servers from mixing — but it means no cross-server unread view.

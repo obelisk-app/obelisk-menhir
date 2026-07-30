@@ -192,7 +192,7 @@ async function selectServer(entry) {
   const onReady = () => {
     if (authed || conn !== c) return;
     authed = true;
-    setServerStatus('online');
+    setServerStatus(isUnprotectedCleartext(entry.url) ? 'online — unencrypted (ws://)' : 'online');
     openMetaSubscriptions(c);
   };
 
@@ -269,6 +269,15 @@ function openMetaSubscriptions(c) {
 }
 
 // ---------- channels & messages ----------
+
+/// True for a plain-ws server that is neither loopback nor an onion address —
+/// i.e. one whose traffic crosses a network in the clear.
+function isUnprotectedCleartext(url) {
+  if (!url.startsWith('ws://')) return false;
+  const host = url.slice(5).split('/')[0].split(':')[0];
+  if (host.endsWith('.onion')) return false; // Tor encrypts end to end
+  return !['127.0.0.1', 'localhost', '::1'].includes(host);
+}
 
 function selectChannel(id) {
   if (!conn) return;
