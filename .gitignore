@@ -12,6 +12,7 @@
 /app/src-tauri/gen/android/app/src/main/jniLibs
 /app/src-tauri/gen/android/app/src/main/assets/tauri.conf.json
 /app/src-tauri/gen/apple
+/app/src-tauri/gen/.gradle-home
 
 # signing material — never commit
 *.keystore
