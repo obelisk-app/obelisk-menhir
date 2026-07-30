@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use arti_client::{TorClient, TorClientConfig};
 use tauri::{AppHandle, Manager, State};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 use tor_rtcompat::PreferredRuntime;
 
@@ -21,6 +21,8 @@ use crate::HostStatus;
 
 #[derive(Default)]
 pub struct NodeInner {
+    /// Shared so every bridge reuses the one bootstrapped client rather than
+    /// building a fresh set of circuits per server.
     tor: Option<Arc<TorClient<PreferredRuntime>>>,
     /// "host:port" of an onion service → local loopback bridge port.
     bridges: HashMap<String, u16>,
@@ -34,6 +36,32 @@ pub fn setup(app: &tauri::App) {
 }
 
 const UNSUPPORTED: &str = "hosting a server is available in the desktop app only";
+
+/// Host and port of a ws:// or wss:// URL.
+///
+/// Deliberately not reusing menhir-core's parser: pulling that crate into the
+/// mobile build would drag secp256k1's C sources along for one line of string
+/// splitting, and with them a cross C toolchain requirement.
+fn ws_host_port(url: &str) -> Result<(String, u16), String> {
+    let (rest, default_port) = match url.strip_prefix("wss://") {
+        Some(rest) => (rest, 443u16),
+        None => match url.strip_prefix("ws://") {
+            Some(rest) => (rest, 80u16),
+            None => return Err("relay url must start with ws:// or wss://".into()),
+        },
+    };
+    let hostport = rest.split('/').next().unwrap_or_default();
+    if hostport.is_empty() {
+        return Err("relay url has no host".into());
+    }
+    match hostport.rsplit_once(':') {
+        Some((host, port)) => {
+            let port = port.parse().map_err(|_| "invalid port".to_string())?;
+            Ok((host.to_string(), port))
+        }
+        None => Ok((hostport.to_string(), default_port)),
+    }
+}
 
 #[tauri::command]
 pub async fn host_status(_state: State<'_, NodeState>) -> Result<HostStatus, String> {
@@ -108,7 +136,6 @@ async fn tor_client(
     let client = TorClient::create_bootstrapped(cfg)
         .await
         .map_err(|e| format!("could not start Tor: {e}"))?;
-    let client = Arc::new(client);
     inner.tor = Some(client.clone());
     Ok(client)
 }
@@ -120,8 +147,7 @@ pub async fn bridge_open(
     state: State<'_, NodeState>,
     onion_url: String,
 ) -> Result<String, String> {
-    let (_tls, host, port) =
-        menhir_core::client::parse_ws_url(&onion_url).map_err(|e| e.to_string())?;
+    let (host, port) = ws_host_port(&onion_url)?;
     if !host.ends_with(".onion") {
         return Err("bridge_open is only for .onion relays".into());
     }

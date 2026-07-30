@@ -153,7 +153,13 @@ function persistSigner() {
 
 async function resolveWsUrl(url) {
   if (!url.includes('.onion')) return url;
-  if (!tauriInvoke) throw new Error('.onion servers need the Menhir desktop app (it runs Tor for you)');
+  if (!tauriInvoke) {
+    throw new Error('.onion servers need the Menhir app — a browser cannot reach Tor on its own');
+  }
+  // The Rust side bridges onion → loopback: a managed Tor on desktop, an
+  // embedded arti on mobile. Either way the first connect builds a circuit,
+  // which is slow enough to be worth saying out loud.
+  setServerStatus('connecting through Tor…');
   return await tauriInvoke('bridge_open', { onionUrl: url });
 }
 
