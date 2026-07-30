@@ -1,0 +1,32 @@
+[package]
+name = "menhir-relay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Obelisk Menhir relay — text-only NIP-29-lite Nostr relay with whitelist, invites, and Tor onion hosting"
+
+[lib]
+name = "menhir_relay"
+path = "src/lib.rs"
+
+[[bin]]
+name = "menhir-relay"
+path = "src/main.rs"
+
+[dependencies]
+menhir-core = { path = "../menhir-core" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+hex.workspace = true
+rand.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+axum = { version = "0.8", features = ["ws"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+clap = { version = "4", features = ["derive"] }
+
+[dev-dependencies]
+menhir-core = { path = "../menhir-core", features = ["client"] }

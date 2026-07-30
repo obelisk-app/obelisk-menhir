@@ -1,0 +1,38 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Obelisk Menhir",
+  "version": "0.1.0",
+  "identifier": "ar.obelisk.menhir",
+  "build": {
+    "frontendDist": "../ui/dist",
+    "beforeBuildCommand": "npm --prefix ../ui run build || npm --prefix ui run build"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "Obelisk Menhir",
+        "width": 1180,
+        "height": 760,
+        "minWidth": 360,
+        "minHeight": 500
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "category": "SocialNetworking",
+    "shortDescription": "Sovereign text channels over Nostr with one-click Tor hosting",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  }
+}

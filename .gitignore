@@ -1,0 +1,29 @@
+/target
+/app/src-tauri/target
+/app/ui/node_modules
+/app/ui/dist
+/app/icon-source.png
+
+# Tauri Android/iOS generated projects — regenerate with `cargo tauri android init`
+/app/src-tauri/gen/android/.gradle
+/app/src-tauri/gen/android/app/build
+/app/src-tauri/gen/android/build
+/app/src-tauri/gen/android/local.properties
+/app/src-tauri/gen/android/app/src/main/jniLibs
+/app/src-tauri/gen/android/app/src/main/assets/tauri.conf.json
+/app/src-tauri/gen/apple
+
+# signing material — never commit
+*.keystore
+*.jks
+keystore.properties
+
+# relay runtime data
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+relay-secret.hex
+/.menhir
+
+.DS_Store
+*.log

@@ -1,0 +1,276 @@
+//! End-to-end tests: real relay on an ephemeral loopback port, real ws clients.
+
+use std::path::PathBuf;
+use std::time::Duration;
+
+use menhir_core::client::Client;
+use menhir_core::{kinds, Event, EventTemplate, Filter, Keys};
+use menhir_relay::config::RelayConfig;
+use menhir_relay::server;
+use serde_json::Value;
+
+const T: Duration = Duration::from_secs(5);
+
+fn scratch_dir(label: &str) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("menhir-test-{label}-{}-{nanos}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+async fn start_relay(label: &str, operator: &Keys, open: bool) -> (server::RelayHandle, server::Shared, String) {
+    let cfg = RelayConfig {
+        port: 0,
+        open,
+        operator_pubkey: Some(operator.pk_hex.clone()),
+        ..RelayConfig::default()
+    };
+    let (handle, st) = server::start(&scratch_dir(label), cfg).await.unwrap();
+    let url = format!("ws://127.0.0.1:{}", handle.port);
+    (handle, st, url)
+}
+
+fn chat(keys: &Keys, channel: &str, text: &str) -> Event {
+    Event::sign(
+        EventTemplate {
+            kind: kinds::CHAT,
+            tags: vec![vec!["h".into(), channel.into()]],
+            content: text.into(),
+            created_at: None,
+        },
+        keys,
+    )
+    .unwrap()
+}
+
+fn create_channel(keys: &Keys, id: &str, name: &str) -> Event {
+    Event::sign(
+        EventTemplate {
+            kind: kinds::CREATE_GROUP,
+            tags: vec![vec!["h".into(), id.into()], vec!["name".into(), name.into()]],
+            content: String::new(),
+            created_at: None,
+        },
+        keys,
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn operator_auth_create_channel_and_chat() {
+    let operator = Keys::generate();
+    let (_handle, _st, url) = start_relay("op", &operator, false).await;
+
+    let mut client = Client::connect(&url, None).await.unwrap();
+    let (authed, msg) = client.auth(&operator, T).await.unwrap();
+    assert!(authed, "operator auth should pass: {msg}");
+
+    let (ok, msg) = client.publish(&create_channel(&operator, "general", "General"), T).await.unwrap();
+    assert!(ok, "create channel: {msg}");
+
+    let (ok, msg) = client.publish(&chat(&operator, "general", "first!"), T).await.unwrap();
+    assert!(ok, "chat should be accepted: {msg}");
+
+    // History comes back, and the relay generated channel metadata.
+    let history = client
+        .req_collect(vec![Filter::new().kinds(vec![kinds::CHAT]).tag("h", vec!["general".into()])], T)
+        .await
+        .unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].content, "first!");
+
+    let meta = client
+        .req_collect(vec![Filter::new().kinds(vec![kinds::GROUP_METADATA])], T)
+        .await
+        .unwrap();
+    assert_eq!(meta.len(), 1);
+    assert_eq!(meta[0].first_tag("d"), Some("general"));
+    assert_eq!(meta[0].first_tag("name"), Some("General"));
+
+    let members = client
+        .req_collect(vec![Filter::new().kinds(vec![kinds::GROUP_MEMBERS]).tag("d", vec!["general".into()])], T)
+        .await
+        .unwrap();
+    assert_eq!(members.len(), 1);
+    assert!(members[0].tag_values("p").contains(&operator.pk_hex.as_str()));
+}
+
+#[tokio::test]
+async fn stranger_needs_invite_then_can_chat() {
+    let operator = Keys::generate();
+    let (_handle, st, url) = start_relay("invite", &operator, false).await;
+
+    // Operator sets the room up.
+    let mut op = Client::connect(&url, None).await.unwrap();
+    op.auth(&operator, T).await.unwrap();
+    op.publish(&create_channel(&operator, "general", "General"), T).await.unwrap();
+
+    // A stranger cannot authenticate or write.
+    let stranger = Keys::generate();
+    let mut client = Client::connect(&url, None).await.unwrap();
+    let (authed, msg) = client.auth(&stranger, T).await.unwrap();
+    assert!(!authed);
+    assert!(msg.starts_with("restricted"), "got: {msg}");
+    let (ok, msg) = client.publish(&chat(&stranger, "general", "let me in"), T).await.unwrap();
+    assert!(!ok);
+    assert!(msg.starts_with("auth-required"), "got: {msg}");
+
+    // A bad invite code is refused.
+    let (ok, _) = client.redeem_invite(&stranger, "wrong-code", T).await.unwrap();
+    assert!(!ok);
+
+    // A real invite whitelists the key and authenticates the connection.
+    let invite = st.db.invite_create(1, None).unwrap();
+    let (ok, msg) = client.redeem_invite(&stranger, &invite.code, T).await.unwrap();
+    assert!(ok, "redeem: {msg}");
+    let (ok, msg) = client.publish(&chat(&stranger, "general", "thanks!"), T).await.unwrap();
+    assert!(ok, "post-invite chat: {msg}");
+
+    // The invite is single-use.
+    let second = Keys::generate();
+    let mut other = Client::connect(&url, None).await.unwrap();
+    let (ok, msg) = other.redeem_invite(&second, &invite.code, T).await.unwrap();
+    assert!(!ok);
+    assert!(msg.contains("used up"), "got: {msg}");
+
+    // …but the stranger's whitelisting persists across reconnects.
+    let mut back = Client::connect(&url, None).await.unwrap();
+    let (authed, _) = back.auth(&stranger, T).await.unwrap();
+    assert!(authed);
+}
+
+#[tokio::test]
+async fn text_only_policy_rejects_other_kinds_and_huge_content() {
+    let operator = Keys::generate();
+    let (_handle, _st, url) = start_relay("policy", &operator, false).await;
+
+    let mut client = Client::connect(&url, None).await.unwrap();
+    client.auth(&operator, T).await.unwrap();
+    client.publish(&create_channel(&operator, "general", "General"), T).await.unwrap();
+
+    // Reactions (kind 7) are not text-channel logic.
+    let reaction = Event::sign(
+        EventTemplate { kind: 7, tags: vec![], content: "+".into(), created_at: None },
+        &operator,
+    )
+    .unwrap();
+    let (ok, msg) = client.publish(&reaction, T).await.unwrap();
+    assert!(!ok);
+    assert!(msg.contains("text-channel"), "got: {msg}");
+
+    // Oversized content is refused.
+    let huge = chat(&operator, "general", &"x".repeat(5000));
+    let (ok, msg) = client.publish(&huge, T).await.unwrap();
+    assert!(!ok);
+    assert!(msg.contains("content exceeds"), "got: {msg}");
+
+    // Chatting into a non-existent channel is refused.
+    let (ok, msg) = client.publish(&chat(&operator, "nope", "hello?"), T).await.unwrap();
+    assert!(!ok);
+    assert!(msg.contains("unknown channel"), "got: {msg}");
+}
+
+#[tokio::test]
+async fn live_subscription_delivers_messages() {
+    let operator = Keys::generate();
+    let (_handle, st, url) = start_relay("live", &operator, false).await;
+
+    let mut sender = Client::connect(&url, None).await.unwrap();
+    sender.auth(&operator, T).await.unwrap();
+    sender.publish(&create_channel(&operator, "general", "General"), T).await.unwrap();
+
+    let friend = Keys::generate();
+    st.db.whitelist_add(&friend.pk_hex, "test").unwrap();
+    let mut listener = Client::connect(&url, None).await.unwrap();
+    listener.auth(&friend, T).await.unwrap();
+    let sub = listener
+        .req_stream(vec![Filter::new().kinds(vec![kinds::CHAT]).tag("h", vec!["general".into()])])
+        .unwrap();
+
+    // Drain until EOSE so the live phase starts.
+    loop {
+        let v = listener.recv(T).await.expect("eose");
+        if v.get(0).and_then(Value::as_str) == Some("EOSE") {
+            break;
+        }
+    }
+
+    sender.publish(&chat(&operator, "general", "ping"), T).await.unwrap();
+
+    let received = loop {
+        let v = listener.recv(T).await.expect("live event");
+        if v.get(0).and_then(Value::as_str) == Some("EVENT")
+            && v.get(1).and_then(Value::as_str) == Some(sub.as_str())
+        {
+            break serde_json::from_value::<Event>(v.get(2).cloned().unwrap()).unwrap();
+        }
+    };
+    assert_eq!(received.content, "ping");
+    assert_eq!(received.pubkey, operator.pk_hex);
+}
+
+#[tokio::test]
+async fn open_relay_needs_no_auth() {
+    let operator = Keys::generate();
+    let (_handle, _st, url) = start_relay("open", &operator, true).await;
+
+    let visitor = Keys::generate();
+    let mut client = Client::connect(&url, None).await.unwrap();
+    let (ok, msg) = client.publish(&create_channel(&visitor, "lobby", "Lobby"), T).await.unwrap();
+    assert!(ok, "open relay create: {msg}");
+    let (ok, msg) = client.publish(&chat(&visitor, "lobby", "hi"), T).await.unwrap();
+    assert!(ok, "open relay chat: {msg}");
+}
+
+#[tokio::test]
+async fn admin_moderation_and_membership() {
+    let operator = Keys::generate();
+    let (_handle, st, url) = start_relay("mod", &operator, false).await;
+
+    let mut op = Client::connect(&url, None).await.unwrap();
+    op.auth(&operator, T).await.unwrap();
+    op.publish(&create_channel(&operator, "general", "General"), T).await.unwrap();
+
+    let member = Keys::generate();
+    st.db.whitelist_add(&member.pk_hex, "test").unwrap();
+    let mut mem = Client::connect(&url, None).await.unwrap();
+    mem.auth(&member, T).await.unwrap();
+
+    // Non-admins cannot moderate.
+    let kick = Event::sign(
+        EventTemplate {
+            kind: kinds::REMOVE_USER,
+            tags: vec![vec!["h".into(), "general".into()], vec!["p".into(), operator.pk_hex.clone()]],
+            content: String::new(),
+            created_at: None,
+        },
+        &member,
+    )
+    .unwrap();
+    let (ok, msg) = mem.publish(&kick, T).await.unwrap();
+    assert!(!ok);
+    assert!(msg.contains("admins only"), "got: {msg}");
+
+    // Joining updates the relay-signed member list.
+    let join = Event::sign(
+        EventTemplate {
+            kind: kinds::JOIN_REQUEST,
+            tags: vec![vec!["h".into(), "general".into()]],
+            content: String::new(),
+            created_at: None,
+        },
+        &member,
+    )
+    .unwrap();
+    let (ok, _) = mem.publish(&join, T).await.unwrap();
+    assert!(ok);
+    let members = mem
+        .req_collect(vec![Filter::new().kinds(vec![kinds::GROUP_MEMBERS]).tag("d", vec!["general".into()])], T)
+        .await
+        .unwrap();
+    assert_eq!(members.len(), 1, "member list is addressable — exactly one survives");
+    assert!(members[0].tag_values("p").contains(&member.pk_hex.as_str()));
+}

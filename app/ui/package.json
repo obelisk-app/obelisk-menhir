@@ -1,0 +1,15 @@
+{
+  "name": "menhir-ui",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Obelisk Menhir web UI (vanilla JS + nostr-tools, bundled with esbuild)",
+  "scripts": {
+    "build": "esbuild src/main.js --bundle --format=iife --minify --outfile=dist/bundle.js && node -e \"const fs=require('fs');fs.copyFileSync('src/index.html','dist/index.html');fs.copyFileSync('src/styles.css','dist/styles.css')\""
+  },
+  "dependencies": {
+    "nostr-tools": "^2.10.4"
+  },
+  "devDependencies": {
+    "esbuild": "^0.24.2"
+  }
+}

@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Obelisk Menhir</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <!-- Login -->
+  <div id="login-screen" class="screen hidden">
+    <div class="login-card lc-card">
+      <div class="login-logo">▲</div>
+      <h1>Obelisk Menhir</h1>
+      <p class="muted">Sovereign text channels over Nostr. Your key is your identity — no email, no password.</p>
+      <textarea id="login-nsec" rows="2" placeholder="Paste your nsec1… or hex secret key"></textarea>
+      <div class="row gap">
+        <button id="login-btn" class="pill primary">Log in</button>
+        <button id="generate-btn" class="pill">Generate new key</button>
+      </div>
+      <p id="login-error" class="error hidden"></p>
+      <div id="generated-box" class="hidden">
+        <p class="warn">Save this secret key somewhere safe — it cannot be recovered.</p>
+        <code id="generated-nsec"></code>
+        <button id="use-generated-btn" class="pill primary">I saved it — continue</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Main app -->
+  <div id="app-screen" class="screen hidden">
+    <aside id="server-rail">
+      <div id="server-list"></div>
+      <button id="add-server-btn" class="rail-btn" title="Add a server">+</button>
+      <div class="rail-spacer"></div>
+      <button id="host-btn" class="rail-btn host hidden" title="Host a server">⌂</button>
+      <button id="logout-btn" class="rail-btn" title="Log out">⏻</button>
+    </aside>
+
+    <aside id="channel-pane">
+      <div id="server-header">
+        <div id="server-name">—</div>
+        <div id="server-status" class="muted small">not connected</div>
+      </div>
+      <div id="channel-list"></div>
+      <button id="create-channel-btn" class="ghost-btn hidden">+ new channel</button>
+      <div id="me-box">
+        <div id="me-name">—</div>
+        <div id="me-npub" class="muted small"></div>
+      </div>
+    </aside>
+
+    <main id="chat-pane">
+      <div id="chat-header">
+        <span id="chat-title">Pick a channel</span>
+      </div>
+      <div id="messages"></div>
+      <div id="composer" class="hidden">
+        <textarea id="composer-input" rows="1" placeholder="Message… (plain text)"></textarea>
+        <button id="send-btn" class="pill primary">Send</button>
+      </div>
+    </main>
+  </div>
+
+  <!-- Add server modal -->
+  <div id="add-server-modal" class="modal hidden">
+    <div class="modal-card lc-card">
+      <h2>Add a server</h2>
+      <p class="muted small">Paste a relay URL (ws://…, wss://…) or an obelisk://join invite link. Onion servers connect through the Tor managed by the desktop app.</p>
+      <input id="add-server-input" placeholder="obelisk://join?relay=ws://…onion&invite=CODE" />
+      <p id="add-server-error" class="error hidden"></p>
+      <div class="row gap right">
+        <button class="pill" data-close="add-server-modal">Cancel</button>
+        <button id="add-server-confirm" class="pill primary">Add & connect</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Create channel modal -->
+  <div id="create-channel-modal" class="modal hidden">
+    <div class="modal-card lc-card">
+      <h2>New channel</h2>
+      <input id="cc-id" placeholder="id (a-z 0-9 - _), e.g. general" />
+      <input id="cc-name" placeholder="Display name" />
+      <input id="cc-about" placeholder="Topic (optional)" />
+      <p id="cc-error" class="error hidden"></p>
+      <div class="row gap right">
+        <button class="pill" data-close="create-channel-modal">Cancel</button>
+        <button id="cc-confirm" class="pill primary">Create</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Host panel modal -->
+  <div id="host-modal" class="modal hidden">
+    <div class="modal-card lc-card wide">
+      <h2>Host a server</h2>
+      <p class="muted small">Runs a Menhir relay on this computer, published as a Tor onion service. Keep the app running to keep your server online.</p>
+      <div id="host-stopped">
+        <input id="host-name" placeholder="Server name" value="My Menhir" />
+        <label class="check"><input type="checkbox" id="host-use-tor" checked /> Publish through Tor (onion service)</label>
+        <p id="host-tor-warning" class="warn hidden">Tor binary not found — the server will only be reachable on this machine. Install Tor (brew install tor / apt install tor) and restart hosting.</p>
+        <button id="host-start-btn" class="pill primary">Start hosting</button>
+      </div>
+      <div id="host-running" class="hidden">
+        <div class="kv"><span>Status</span><b id="host-state">—</b></div>
+        <div class="kv"><span>Local relay</span><code id="host-local-url">—</code></div>
+        <div class="kv"><span>Onion address</span><code id="host-onion">—</code></div>
+        <div class="kv"><span>Share link</span>
+          <div class="row gap">
+            <code id="host-share" class="grow">—</code>
+            <button id="host-copy-share" class="pill small-btn">Copy</button>
+          </div>
+        </div>
+        <button id="host-open-local" class="pill">Open my server in the app</button>
+        <h3>Invitations</h3>
+        <div class="row gap">
+          <button id="host-invite-btn" class="pill">Create invite (1 use)</button>
+          <code id="host-invite-out" class="grow"></code>
+        </div>
+        <h3>Whitelist</h3>
+        <div class="row gap">
+          <input id="host-wl-input" class="grow" placeholder="npub1…" />
+          <button id="host-wl-add" class="pill">Whitelist</button>
+        </div>
+        <div id="host-wl-list" class="wl-list"></div>
+        <button id="host-stop-btn" class="pill danger">Stop hosting</button>
+      </div>
+      <p id="host-error" class="error hidden"></p>
+      <div class="row right">
+        <button class="pill" data-close="host-modal">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="bundle.js"></script>
+</body>
+</html>
