@@ -226,6 +226,71 @@ async fn text_only_policy_rejects_other_kinds_and_huge_content() {
     assert!(msg.contains("unknown channel"), "got: {msg}");
 }
 
+/// Tags are indexed storage, so the content cap alone does not bound an
+/// event: a small message carrying tens of thousands of tags would write a
+/// row per tag. The relay must refuse it.
+#[tokio::test]
+async fn oversized_tag_lists_are_rejected() {
+    let operator = Keys::generate();
+    let (_handle, st, url) = start_relay("tags", &operator, false).await;
+
+    let mut client = Client::connect(&url, None).await.unwrap();
+    client.auth(&operator, T).await.unwrap();
+    client
+        .publish(&create_channel(&operator, "general", "General"), T)
+        .await
+        .unwrap();
+
+    // 20k tags: tiny content, ~1.3 MB event.
+    let mut tags = vec![vec!["h".to_string(), "general".to_string()]];
+    for i in 0..20_000 {
+        tags.push(vec!["e".to_string(), format!("{i:064x}")]);
+    }
+    let flood = Event::sign(
+        EventTemplate {
+            kind: kinds::CHAT,
+            tags,
+            content: "x".into(),
+            created_at: None,
+        },
+        &operator,
+    )
+    .unwrap();
+    let (ok, msg) = client.publish(&flood, T).await.unwrap();
+    assert!(!ok, "20k-tag event must be refused");
+    assert!(msg.contains("too many tags"), "got: {msg}");
+
+    // A single enormous tag value is refused too.
+    let fat_tag = Event::sign(
+        EventTemplate {
+            kind: kinds::CHAT,
+            tags: vec![
+                vec!["h".into(), "general".into()],
+                vec!["e".into(), "z".repeat(9000)],
+            ],
+            content: "x".into(),
+            created_at: None,
+        },
+        &operator,
+    )
+    .unwrap();
+    let (ok, msg) = client.publish(&fat_tag, T).await.unwrap();
+    assert!(!ok, "oversized tag value must be refused");
+    assert!(msg.contains("tag value exceeds"), "got: {msg}");
+
+    // Nothing was stored, and ordinary messages still work.
+    let stored = st
+        .db
+        .query(&[Filter::new().kinds(vec![kinds::CHAT])])
+        .unwrap();
+    assert!(stored.is_empty(), "rejected events must not be stored");
+    let (ok, msg) = client
+        .publish(&chat(&operator, "general", "still fine"), T)
+        .await
+        .unwrap();
+    assert!(ok, "normal chat after rejection: {msg}");
+}
+
 #[tokio::test]
 async fn live_subscription_delivers_messages() {
     let operator = Keys::generate();

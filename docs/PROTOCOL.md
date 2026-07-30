@@ -26,6 +26,13 @@ Everything else is rejected with `restricted: this relay accepts text-channel
 events only`. Content is capped (default 4096 bytes). `created_at` may be at
 most 15 minutes in the future.
 
+Tags are bounded too, because each indexed tag becomes a stored row and the
+content cap alone would not stop a small message carrying tens of thousands
+of them: at most **100 tags** per event, each item at most **1024 bytes**.
+Both limits are checked before signature verification and before the
+authentication branches, so refusing costs the relay almost nothing and an
+unauthenticated peer cannot use the path either.
+
 ## Channel ids
 
 `h`/`d` values are 1–64 characters of `a-z 0-9 - _`. Chat into a channel that

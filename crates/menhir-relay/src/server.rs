@@ -21,6 +21,11 @@ use crate::db::{Db, StoreResult};
 const MAX_SUBS_PER_CONN: usize = 32;
 const MAX_FUTURE_DRIFT_SECS: u64 = 900;
 const AUTH_FRESHNESS_SECS: u64 = 600;
+/// Tags are storage the operator did not consent to: each indexed tag becomes
+/// a row. Without these caps the content limit is trivially bypassed by
+/// sending one small message carrying tens of thousands of tags.
+const MAX_TAGS: usize = 100;
+const MAX_TAG_ITEM_LEN: usize = 1024;
 
 pub struct RelayState {
     pub cfg: RelayConfig,
@@ -166,6 +171,23 @@ async fn handle_socket(mut socket: WebSocket, st: Shared) {
     }
 }
 
+/// Reject events whose tag list is the real payload. Checked before any
+/// signature work so the cost of refusing is minimal, and before the
+/// authentication branches so an unauthenticated peer cannot use it either.
+fn tag_limit_error(ev: &Event) -> Option<String> {
+    if ev.tags.len() > MAX_TAGS {
+        return Some(format!("invalid: too many tags (max {MAX_TAGS})"));
+    }
+    for tag in &ev.tags {
+        if tag.iter().any(|item| item.len() > MAX_TAG_ITEM_LEN) {
+            return Some(format!(
+                "invalid: tag value exceeds {MAX_TAG_ITEM_LEN} bytes"
+            ));
+        }
+    }
+    None
+}
+
 fn handle_client_message(st: &RelayState, ctx: &mut ConnCtx, txt: &str) -> Vec<Value> {
     let Ok(msg) = serde_json::from_str::<Value>(txt) else {
         return vec![json!(["NOTICE", "invalid: could not parse message"])];
@@ -173,13 +195,19 @@ fn handle_client_message(st: &RelayState, ctx: &mut ConnCtx, txt: &str) -> Vec<V
     match msg.get(0).and_then(Value::as_str) {
         Some("EVENT") => {
             match serde_json::from_value::<Event>(msg.get(1).cloned().unwrap_or(Value::Null)) {
-                Ok(ev) => handle_event(st, ctx, ev),
+                Ok(ev) => match tag_limit_error(&ev) {
+                    Some(reason) => vec![json!(["OK", ev.id, false, reason])],
+                    None => handle_event(st, ctx, ev),
+                },
                 Err(_) => vec![json!(["NOTICE", "invalid: malformed event"])],
             }
         }
         Some("AUTH") => {
             match serde_json::from_value::<Event>(msg.get(1).cloned().unwrap_or(Value::Null)) {
-                Ok(ev) => handle_auth(st, ctx, ev),
+                Ok(ev) => match tag_limit_error(&ev) {
+                    Some(reason) => vec![json!(["OK", ev.id, false, reason])],
+                    None => handle_auth(st, ctx, ev),
+                },
                 Err(_) => vec![json!(["NOTICE", "invalid: malformed auth event"])],
             }
         }
