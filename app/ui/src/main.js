@@ -500,7 +500,10 @@ function addServer(url, invite) {
   selectServer(entry);
 }
 
+let currentQrText = '';
+
 async function showQR(title, text) {
+  currentQrText = text;
   setText($('qr-title'), title);
   setText($('qr-text'), text);
   show($('qr-modal'));
@@ -509,7 +512,6 @@ async function showQR(title, text) {
   } catch (e) {
     setText($('qr-text'), 'Could not render a QR: ' + (e.message || e));
   }
-  $('qr-copy').onclick = async () => { await copyText(text); flash($('qr-copy')); };
 }
 
 async function openScanner() {
@@ -752,6 +754,7 @@ function wireApp() {
     }
   };
   $('scan-qr-btn').onclick = openScanner;
+  $('qr-copy').onclick = async () => { await copyText(currentQrText); flash($('qr-copy')); };
   $('server-qr-btn').onclick = () => {
     if (activeServer) showQR('Share this server', `obelisk://join?relay=${activeServer.url}`);
   };
