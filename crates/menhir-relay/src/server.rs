@@ -59,7 +59,12 @@ pub async fn start(data_dir: &Path, cfg: RelayConfig) -> Result<(RelayHandle, Sh
         db.whitelist_add(op, "operator")?;
     }
     let (tx, _) = broadcast::channel(512);
-    let st: Shared = Arc::new(RelayState { cfg: cfg.clone(), db, keys, broadcast: tx });
+    let st: Shared = Arc::new(RelayState {
+        cfg: cfg.clone(),
+        db,
+        keys,
+        broadcast: tx,
+    });
 
     let app = Router::new().route("/", get(root)).with_state(st.clone());
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", cfg.port)).await?;
@@ -166,14 +171,18 @@ fn handle_client_message(st: &RelayState, ctx: &mut ConnCtx, txt: &str) -> Vec<V
         return vec![json!(["NOTICE", "invalid: could not parse message"])];
     };
     match msg.get(0).and_then(Value::as_str) {
-        Some("EVENT") => match serde_json::from_value::<Event>(msg.get(1).cloned().unwrap_or(Value::Null)) {
-            Ok(ev) => handle_event(st, ctx, ev),
-            Err(_) => vec![json!(["NOTICE", "invalid: malformed event"])],
-        },
-        Some("AUTH") => match serde_json::from_value::<Event>(msg.get(1).cloned().unwrap_or(Value::Null)) {
-            Ok(ev) => handle_auth(st, ctx, ev),
-            Err(_) => vec![json!(["NOTICE", "invalid: malformed auth event"])],
-        },
+        Some("EVENT") => {
+            match serde_json::from_value::<Event>(msg.get(1).cloned().unwrap_or(Value::Null)) {
+                Ok(ev) => handle_event(st, ctx, ev),
+                Err(_) => vec![json!(["NOTICE", "invalid: malformed event"])],
+            }
+        }
+        Some("AUTH") => {
+            match serde_json::from_value::<Event>(msg.get(1).cloned().unwrap_or(Value::Null)) {
+                Ok(ev) => handle_auth(st, ctx, ev),
+                Err(_) => vec![json!(["NOTICE", "invalid: malformed auth event"])],
+            }
+        }
         Some("REQ") => handle_req(st, ctx, &msg),
         Some("CLOSE") => {
             if let Some(subid) = msg.get(1).and_then(Value::as_str) {
@@ -190,17 +199,34 @@ fn handle_req(st: &RelayState, ctx: &mut ConnCtx, msg: &Value) -> Vec<Value> {
         return vec![json!(["NOTICE", "invalid: REQ needs a subscription id"])];
     };
     if !st.cfg.open && ctx.authed.is_none() {
-        return vec![json!(["CLOSED", subid, "auth-required: authenticate or redeem an invite first"])];
+        return vec![json!([
+            "CLOSED",
+            subid,
+            "auth-required: authenticate or redeem an invite first"
+        ])];
     }
     let filters: Vec<Filter> = msg
         .as_array()
-        .map(|a| a.iter().skip(2).filter_map(|f| serde_json::from_value(f.clone()).ok()).collect())
+        .map(|a| {
+            a.iter()
+                .skip(2)
+                .filter_map(|f| serde_json::from_value(f.clone()).ok())
+                .collect()
+        })
         .unwrap_or_default();
     if filters.is_empty() {
-        return vec![json!(["CLOSED", subid, "invalid: REQ needs at least one filter"])];
+        return vec![json!([
+            "CLOSED",
+            subid,
+            "invalid: REQ needs at least one filter"
+        ])];
     }
     if ctx.subs.len() >= MAX_SUBS_PER_CONN && !ctx.subs.contains_key(subid) {
-        return vec![json!(["CLOSED", subid, "rate-limited: too many subscriptions"])];
+        return vec![json!([
+            "CLOSED",
+            subid,
+            "rate-limited: too many subscriptions"
+        ])];
     }
 
     let mut replies = Vec::new();
@@ -239,7 +265,11 @@ fn handle_auth(st: &RelayState, ctx: &mut ConnCtx, ev: Event) -> Vec<Value> {
         ctx.authed = Some(ev.pubkey.clone());
         ok(true, "welcome", &ev.id)
     } else {
-        ok(false, "restricted: pubkey not whitelisted — ask the operator for an invite", &ev.id)
+        ok(
+            false,
+            "restricted: pubkey not whitelisted — ask the operator for an invite",
+            &ev.id,
+        )
     }
 }
 
@@ -261,7 +291,9 @@ fn is_admin(st: &RelayState, group_id: &str, pubkey: &str) -> bool {
 fn valid_group_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 64
-        && id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+        && id
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
 }
 
 fn handle_event(st: &RelayState, ctx: &mut ConnCtx, ev: Event) -> Vec<Value> {
@@ -297,13 +329,25 @@ fn handle_event(st: &RelayState, ctx: &mut ConnCtx, ev: Event) -> Vec<Value> {
     }
 
     if !st.cfg.open && ctx.authed.as_deref() != Some(ev.pubkey.as_str()) {
-        return ok(false, "auth-required: authenticate or redeem an invite first".into());
+        return ok(
+            false,
+            "auth-required: authenticate or redeem an invite first".into(),
+        );
     }
     if !kinds::ALLOWED_CLIENT_KINDS.contains(&ev.kind) {
-        return ok(false, "restricted: this relay accepts text-channel events only".into());
+        return ok(
+            false,
+            "restricted: this relay accepts text-channel events only".into(),
+        );
     }
     if ev.content.len() > st.cfg.max_content_len {
-        return ok(false, format!("invalid: content exceeds {} bytes (text only)", st.cfg.max_content_len));
+        return ok(
+            false,
+            format!(
+                "invalid: content exceeds {} bytes (text only)",
+                st.cfg.max_content_len
+            ),
+        );
     }
     if ev.created_at > menhir_core::now() + MAX_FUTURE_DRIFT_SECS {
         return ok(false, "invalid: created_at too far in the future".into());
@@ -315,18 +359,28 @@ fn handle_event(st: &RelayState, ctx: &mut ConnCtx, ev: Event) -> Vec<Value> {
         match ev.kind {
             kinds::PROFILE => Ok(()),
             kinds::CHAT => {
-                let group_id = ev.first_tag("h").ok_or("invalid: chat needs an h tag")?.to_string();
+                let group_id = ev
+                    .first_tag("h")
+                    .ok_or("invalid: chat needs an h tag")?
+                    .to_string();
                 if st.db.group_get(&group_id).map_err(db_err)?.is_none() {
                     return Err("invalid: unknown channel".into());
                 }
                 // First message in a channel makes you a listed member.
-                if st.db.member_add_if_absent(&group_id, &ev.pubkey, "member").map_err(db_err)? {
+                if st
+                    .db
+                    .member_add_if_absent(&group_id, &ev.pubkey, "member")
+                    .map_err(db_err)?
+                {
                     extra_events.extend(group_meta_events(st, &group_id).map_err(db_err)?);
                 }
                 Ok(())
             }
             kinds::CREATE_GROUP => {
-                let group_id = ev.first_tag("h").ok_or("invalid: create-group needs an h tag")?.to_string();
+                let group_id = ev
+                    .first_tag("h")
+                    .ok_or("invalid: create-group needs an h tag")?
+                    .to_string();
                 if !valid_group_id(&group_id) {
                     return Err("invalid: channel id must be 1-64 chars of a-z 0-9 - _".into());
                 }
@@ -336,31 +390,50 @@ fn handle_event(st: &RelayState, ctx: &mut ConnCtx, ev: Event) -> Vec<Value> {
                     .filter(|n| !n.is_empty())
                     .unwrap_or_else(|| group_id.clone());
                 let about = ev.first_tag("about").unwrap_or("").to_string();
-                if !st.db.group_create(&group_id, &name, &about, &ev.pubkey).map_err(db_err)? {
+                if !st
+                    .db
+                    .group_create(&group_id, &name, &about, &ev.pubkey)
+                    .map_err(db_err)?
+                {
                     return Err("duplicate: channel already exists".into());
                 }
-                st.db.member_add(&group_id, &ev.pubkey, "admin").map_err(db_err)?;
+                st.db
+                    .member_add(&group_id, &ev.pubkey, "admin")
+                    .map_err(db_err)?;
                 extra_events.extend(group_meta_events(st, &group_id).map_err(db_err)?);
                 Ok(())
             }
             kinds::JOIN_REQUEST => {
-                let group_id = ev.first_tag("h").ok_or("invalid: join needs an h tag")?.to_string();
+                let group_id = ev
+                    .first_tag("h")
+                    .ok_or("invalid: join needs an h tag")?
+                    .to_string();
                 if st.db.group_get(&group_id).map_err(db_err)?.is_none() {
                     return Err("invalid: unknown channel".into());
                 }
-                if st.db.member_add_if_absent(&group_id, &ev.pubkey, "member").map_err(db_err)? {
+                if st
+                    .db
+                    .member_add_if_absent(&group_id, &ev.pubkey, "member")
+                    .map_err(db_err)?
+                {
                     extra_events.extend(group_meta_events(st, &group_id).map_err(db_err)?);
                 }
                 Ok(())
             }
             kinds::LEAVE_REQUEST => {
-                let group_id = ev.first_tag("h").ok_or("invalid: leave needs an h tag")?.to_string();
+                let group_id = ev
+                    .first_tag("h")
+                    .ok_or("invalid: leave needs an h tag")?
+                    .to_string();
                 st.db.member_remove(&group_id, &ev.pubkey).map_err(db_err)?;
                 extra_events.extend(group_meta_events(st, &group_id).map_err(db_err)?);
                 Ok(())
             }
             kinds::PUT_USER | kinds::REMOVE_USER | kinds::EDIT_METADATA | kinds::DELETE_GROUP => {
-                let group_id = ev.first_tag("h").ok_or("invalid: moderation needs an h tag")?.to_string();
+                let group_id = ev
+                    .first_tag("h")
+                    .ok_or("invalid: moderation needs an h tag")?
+                    .to_string();
                 if st.db.group_get(&group_id).map_err(db_err)?.is_none() {
                     return Err("invalid: unknown channel".into());
                 }
@@ -389,7 +462,11 @@ fn handle_event(st: &RelayState, ctx: &mut ConnCtx, ev: Event) -> Vec<Value> {
                     }
                     kinds::EDIT_METADATA => {
                         st.db
-                            .group_update_meta(&group_id, ev.first_tag("name"), ev.first_tag("about"))
+                            .group_update_meta(
+                                &group_id,
+                                ev.first_tag("name"),
+                                ev.first_tag("about"),
+                            )
                             .map_err(db_err)?;
                     }
                     kinds::DELETE_GROUP => {
@@ -413,7 +490,9 @@ fn handle_event(st: &RelayState, ctx: &mut ConnCtx, ev: Event) -> Vec<Value> {
     if !kinds::is_ephemeral(ev.kind) {
         match st.db.insert_event(&ev) {
             Ok(StoreResult::Stored) => {}
-            Ok(StoreResult::Duplicate) => return ok(true, "duplicate: already have this event".into()),
+            Ok(StoreResult::Duplicate) => {
+                return ok(true, "duplicate: already have this event".into())
+            }
             Ok(StoreResult::Stale) => return ok(true, "duplicate: newer version exists".into()),
             Err(e) => {
                 tracing::warn!(error = %e, "event insert failed");
@@ -451,7 +530,12 @@ pub fn group_meta_events(st: &RelayState, group_id: &str) -> anyhow::Result<Vec<
         meta_tags.push(vec!["about".to_string(), group.about.clone()]);
     }
     let metadata = Event::sign(
-        EventTemplate { kind: kinds::GROUP_METADATA, tags: meta_tags, content: String::new(), created_at: Some(now) },
+        EventTemplate {
+            kind: kinds::GROUP_METADATA,
+            tags: meta_tags,
+            content: String::new(),
+            created_at: Some(now),
+        },
         &st.keys,
     )?;
 
@@ -464,11 +548,21 @@ pub fn group_meta_events(st: &RelayState, group_id: &str) -> anyhow::Result<Vec<
         }
     }
     let admins = Event::sign(
-        EventTemplate { kind: kinds::GROUP_ADMINS, tags: admin_tags, content: String::new(), created_at: Some(now) },
+        EventTemplate {
+            kind: kinds::GROUP_ADMINS,
+            tags: admin_tags,
+            content: String::new(),
+            created_at: Some(now),
+        },
         &st.keys,
     )?;
     let member_list = Event::sign(
-        EventTemplate { kind: kinds::GROUP_MEMBERS, tags: member_tags, content: String::new(), created_at: Some(now) },
+        EventTemplate {
+            kind: kinds::GROUP_MEMBERS,
+            tags: member_tags,
+            content: String::new(),
+            created_at: Some(now),
+        },
         &st.keys,
     )?;
     Ok(vec![metadata, admins, member_list])

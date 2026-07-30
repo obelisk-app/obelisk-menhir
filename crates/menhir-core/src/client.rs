@@ -237,7 +237,12 @@ impl Client {
     }
 
     /// Redeem a Menhir invite code (signed ephemeral event, kind 20284).
-    pub async fn redeem_invite(&mut self, keys: &Keys, code: &str, timeout: Duration) -> Result<(bool, String)> {
+    pub async fn redeem_invite(
+        &mut self,
+        keys: &Keys,
+        code: &str,
+        timeout: Duration,
+    ) -> Result<(bool, String)> {
         let ev = Event::sign(
             EventTemplate {
                 kind: kinds::INVITE_REDEEM,
@@ -251,7 +256,11 @@ impl Client {
     }
 
     /// Open a subscription and collect events until EOSE, then CLOSE it.
-    pub async fn req_collect(&mut self, filters: Vec<Filter>, timeout: Duration) -> Result<Vec<Event>> {
+    pub async fn req_collect(
+        &mut self,
+        filters: Vec<Filter>,
+        timeout: Duration,
+    ) -> Result<Vec<Event>> {
         let sub = format!("m{}", rand::random::<u32>());
         let mut req = vec![json!("REQ"), json!(sub)];
         for f in &filters {
@@ -308,9 +317,18 @@ mod tests {
 
     #[test]
     fn parses_ws_urls() {
-        assert_eq!(parse_ws_url("ws://127.0.0.1:4869").unwrap(), (false, "127.0.0.1".into(), 4869));
-        assert_eq!(parse_ws_url("ws://abc.onion/path").unwrap(), (false, "abc.onion".into(), 80));
-        assert_eq!(parse_ws_url("wss://relay.obelisk.ar").unwrap(), (true, "relay.obelisk.ar".into(), 443));
+        assert_eq!(
+            parse_ws_url("ws://127.0.0.1:4869").unwrap(),
+            (false, "127.0.0.1".into(), 4869)
+        );
+        assert_eq!(
+            parse_ws_url("ws://abc.onion/path").unwrap(),
+            (false, "abc.onion".into(), 80)
+        );
+        assert_eq!(
+            parse_ws_url("wss://relay.obelisk.ar").unwrap(),
+            (true, "relay.obelisk.ar".into(), 443)
+        );
         assert!(parse_ws_url("http://x").is_err());
     }
 }

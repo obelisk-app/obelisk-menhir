@@ -52,7 +52,8 @@ impl Filter {
     }
 
     pub fn tag(mut self, name: &str, values: Vec<String>) -> Filter {
-        self.extra.insert(format!("#{name}"), serde_json::json!(values));
+        self.extra
+            .insert(format!("#{name}"), serde_json::json!(values));
         self
     }
 
@@ -131,7 +132,9 @@ mod tests {
     #[test]
     fn matches_kind_and_tag() {
         let ev = chat_event("general", "hi");
-        let f = Filter::new().kinds(vec![9]).tag("h", vec!["general".into()]);
+        let f = Filter::new()
+            .kinds(vec![9])
+            .tag("h", vec!["general".into()]);
         assert!(f.matches(&ev));
         let f2 = Filter::new().kinds(vec![9]).tag("h", vec!["other".into()]);
         assert!(!f2.matches(&ev));
@@ -141,12 +144,18 @@ mod tests {
 
     #[test]
     fn serde_roundtrip_with_tag_filter() {
-        let f = Filter::new().kinds(vec![9]).tag("h", vec!["general".into()]).limit(50);
+        let f = Filter::new()
+            .kinds(vec![9])
+            .tag("h", vec!["general".into()])
+            .limit(50);
         let json = serde_json::to_string(&f).unwrap();
         assert!(json.contains("\"#h\""));
         let parsed: Filter = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.kinds, Some(vec![9]));
-        assert_eq!(parsed.tag_filters(), vec![("h".to_string(), vec!["general".to_string()])]);
+        assert_eq!(
+            parsed.tag_filters(),
+            vec![("h".to_string(), vec!["general".to_string()])]
+        );
         assert_eq!(parsed.limit, Some(50));
     }
 

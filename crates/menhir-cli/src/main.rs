@@ -17,7 +17,11 @@ use serde_json::{json, Value};
 const T: Duration = Duration::from_secs(15);
 
 #[derive(Parser)]
-#[command(name = "menhir", version, about = "Obelisk Menhir — text channels over Nostr, in your terminal")]
+#[command(
+    name = "menhir",
+    version,
+    about = "Obelisk Menhir — text channels over Nostr, in your terminal"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -186,7 +190,12 @@ fn print_message(ev: &Event, json: bool) {
             })
         );
     } else {
-        println!("[{}] {}: {}", ev.created_at, short_npub(&ev.pubkey), ev.content);
+        println!(
+            "[{}] {}: {}",
+            ev.created_at,
+            short_npub(&ev.pubkey),
+            ev.content
+        );
     }
 }
 
@@ -250,7 +259,10 @@ fn parse_join_link(link: &str) -> Result<(String, Option<String>)> {
             _ => {}
         }
     }
-    Ok((relay.ok_or_else(|| anyhow::anyhow!("link has no relay parameter"))?, invite))
+    Ok((
+        relay.ok_or_else(|| anyhow::anyhow!("link has no relay parameter"))?,
+        invite,
+    ))
 }
 
 #[tokio::main]
@@ -287,7 +299,10 @@ async fn main() -> Result<()> {
         Cmd::Channels { conn, json } => {
             let (mut client, _) = connect_and_auth(&conn).await?;
             let metas = client
-                .req_collect(vec![Filter::new().kinds(vec![kinds::GROUP_METADATA]).limit(500)], T)
+                .req_collect(
+                    vec![Filter::new().kinds(vec![kinds::GROUP_METADATA]).limit(500)],
+                    T,
+                )
                 .await?;
             for ev in metas {
                 let id = ev.first_tag("d").unwrap_or("?").to_string();
@@ -302,11 +317,19 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Cmd::History { conn, channel, limit, json } => {
+        Cmd::History {
+            conn,
+            channel,
+            limit,
+            json,
+        } => {
             let (mut client, _) = connect_and_auth(&conn).await?;
             let events = client
                 .req_collect(
-                    vec![Filter::new().kinds(vec![kinds::CHAT]).tag("h", vec![channel.clone()]).limit(limit)],
+                    vec![Filter::new()
+                        .kinds(vec![kinds::CHAT])
+                        .tag("h", vec![channel.clone()])
+                        .limit(limit)],
                     T,
                 )
                 .await?;
@@ -314,7 +337,11 @@ async fn main() -> Result<()> {
                 print_message(ev, json);
             }
         }
-        Cmd::Listen { conn, channel, json } => {
+        Cmd::Listen {
+            conn,
+            channel,
+            json,
+        } => {
             let (mut client, _) = connect_and_auth(&conn).await?;
             let now = menhir_core::now();
             let sub = client.req_stream(vec![Filter::new()
@@ -339,7 +366,11 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Cmd::Send { conn, channel, message } => {
+        Cmd::Send {
+            conn,
+            channel,
+            message,
+        } => {
             let (mut client, keys) = connect_and_auth(&conn).await?;
             let keys = require_keys(keys)?;
             let ev = Event::sign(
@@ -354,7 +385,12 @@ async fn main() -> Result<()> {
             publish_checked(&mut client, &ev).await?;
             println!("sent to #{channel} ({})", ev.id);
         }
-        Cmd::CreateChannel { conn, id, name, about } => {
+        Cmd::CreateChannel {
+            conn,
+            id,
+            name,
+            about,
+        } => {
             let (mut client, keys) = connect_and_auth(&conn).await?;
             let keys = require_keys(keys)?;
             let mut tags = vec![vec!["h".to_string(), id.clone()]];
@@ -365,7 +401,12 @@ async fn main() -> Result<()> {
                 tags.push(vec!["about".into(), about]);
             }
             let ev = Event::sign(
-                EventTemplate { kind: kinds::CREATE_GROUP, tags, content: String::new(), created_at: None },
+                EventTemplate {
+                    kind: kinds::CREATE_GROUP,
+                    tags,
+                    content: String::new(),
+                    created_at: None,
+                },
                 &keys,
             )?;
             publish_checked(&mut client, &ev).await?;
@@ -393,7 +434,11 @@ async fn main() -> Result<()> {
             if !ok {
                 bail!("invite rejected: {msg}");
             }
-            println!("invite accepted — {} is now whitelisted on {}", keys.npub(), conn.relay);
+            println!(
+                "invite accepted — {} is now whitelisted on {}",
+                keys.npub(),
+                conn.relay
+            );
         }
         Cmd::JoinLink { link, nsec, socks5 } => {
             let (relay, invite) = parse_join_link(&link)?;
@@ -426,7 +471,12 @@ async fn main() -> Result<()> {
                 profile["about"] = json!(about);
             }
             let ev = Event::sign(
-                EventTemplate { kind: kinds::PROFILE, tags: vec![], content: profile.to_string(), created_at: None },
+                EventTemplate {
+                    kind: kinds::PROFILE,
+                    tags: vec![],
+                    content: profile.to_string(),
+                    created_at: None,
+                },
                 &keys,
             )?;
             publish_checked(&mut client, &ev).await?;
@@ -468,14 +518,29 @@ async fn main() -> Result<()> {
                 }
                 AdminCmd::WhitelistRemove { pubkey } => {
                     let hex = pubkey_to_hex(&pubkey)?;
-                    println!("{}", if db.whitelist_remove(&hex)? { "removed" } else { "not on the whitelist" });
+                    println!(
+                        "{}",
+                        if db.whitelist_remove(&hex)? {
+                            "removed"
+                        } else {
+                            "not on the whitelist"
+                        }
+                    );
                 }
-                AdminCmd::InviteCreate { max_uses, expires_hours } => {
+                AdminCmd::InviteCreate {
+                    max_uses,
+                    expires_hours,
+                } => {
                     let expires_at = expires_hours.map(|h| menhir_core::now() + h * 3600);
                     let invite = db.invite_create(max_uses, expires_at)?;
                     println!("{}", invite.code);
-                    if let Some(onion) = menhir_relay::tor::read_onion_hostname(&data_dir.join("tor")) {
-                        println!("share: obelisk://join?relay=ws://{onion}&invite={}", invite.code);
+                    if let Some(onion) =
+                        menhir_relay::tor::read_onion_hostname(&data_dir.join("tor"))
+                    {
+                        println!(
+                            "share: obelisk://join?relay=ws://{onion}&invite={}",
+                            invite.code
+                        );
                     }
                 }
                 AdminCmd::InviteList => {
@@ -485,7 +550,9 @@ async fn main() -> Result<()> {
                             inv.code,
                             inv.uses,
                             inv.max_uses,
-                            inv.expires_at.map(|e| e.to_string()).unwrap_or_else(|| "never".into())
+                            inv.expires_at
+                                .map(|e| e.to_string())
+                                .unwrap_or_else(|| "never".into())
                         );
                     }
                 }

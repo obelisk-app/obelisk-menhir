@@ -46,7 +46,8 @@ pub fn config_path(data_dir: &Path) -> PathBuf {
 pub fn load_config(data_dir: &Path) -> Result<RelayConfig> {
     let path = config_path(data_dir);
     if path.exists() {
-        let raw = fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+        let raw =
+            fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
         Ok(serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?)
     } else {
         Ok(RelayConfig::default())

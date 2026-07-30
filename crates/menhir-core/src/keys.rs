@@ -29,7 +29,8 @@ impl Keys {
         let sk_hex = if trimmed.starts_with("nsec1") {
             nip19_decode(trimmed, "nsec")?
         } else {
-            let bytes = hex::decode(trimmed).map_err(|_| anyhow::anyhow!("secret key must be nsec1… or 64-char hex"))?;
+            let bytes = hex::decode(trimmed)
+                .map_err(|_| anyhow::anyhow!("secret key must be nsec1… or 64-char hex"))?;
             if bytes.len() != 32 {
                 anyhow::bail!("secret key must be 32 bytes");
             }
@@ -39,7 +40,10 @@ impl Keys {
         let sk = SecretKey::from_slice(&hex::decode(&sk_hex)?)?;
         let kp = Keypair::from_secret_key(&secp, &sk);
         let (xonly, _) = kp.x_only_public_key();
-        Ok(Keys { sk_hex, pk_hex: hex::encode(xonly.serialize()) })
+        Ok(Keys {
+            sk_hex,
+            pk_hex: hex::encode(xonly.serialize()),
+        })
     }
 
     pub fn npub(&self) -> String {
@@ -55,7 +59,9 @@ impl Keys {
         let secp = Secp256k1::new();
         let sk = SecretKey::from_slice(&hex::decode(&self.sk_hex)?)?;
         let kp = Keypair::from_secret_key(&secp, &sk);
-        let digest: [u8; 32] = digest.try_into().map_err(|_| anyhow::anyhow!("digest must be 32 bytes"))?;
+        let digest: [u8; 32] = digest
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("digest must be 32 bytes"))?;
         let msg = Message::from_digest(digest);
         let sig = secp.sign_schnorr_no_aux_rand(&msg, &kp);
         Ok(hex::encode(sig.as_ref()))
@@ -87,7 +93,8 @@ pub fn pubkey_to_hex(input: &str) -> anyhow::Result<String> {
     if trimmed.starts_with("npub1") {
         nip19_decode(trimmed, "npub")
     } else {
-        let bytes = hex::decode(trimmed).map_err(|_| anyhow::anyhow!("pubkey must be npub1… or 64-char hex"))?;
+        let bytes = hex::decode(trimmed)
+            .map_err(|_| anyhow::anyhow!("pubkey must be npub1… or 64-char hex"))?;
         if bytes.len() != 32 {
             anyhow::bail!("pubkey must be 32 bytes");
         }

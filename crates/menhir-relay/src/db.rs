@@ -93,7 +93,9 @@ impl Db {
                 PRIMARY KEY (group_id, pubkey)
             );",
         )?;
-        Ok(Db { conn: Mutex::new(conn) })
+        Ok(Db {
+            conn: Mutex::new(conn),
+        })
     }
 
     // ---- events ----
@@ -102,7 +104,9 @@ impl Db {
         let conn = self.conn.lock().unwrap();
 
         let exists: bool = conn
-            .query_row("SELECT 1 FROM events WHERE id = ?1", params![ev.id], |_| Ok(true))
+            .query_row("SELECT 1 FROM events WHERE id = ?1", params![ev.id], |_| {
+                Ok(true)
+            })
             .unwrap_or(false);
         if exists {
             return Ok(StoreResult::Duplicate);
@@ -110,9 +114,8 @@ impl Db {
 
         // Replaceable semantics: newest (created_at, then id) wins.
         let replaced_ids: Vec<String> = if kinds::is_replaceable(ev.kind) {
-            let mut stmt = conn.prepare(
-                "SELECT id, created_at FROM events WHERE kind = ?1 AND pubkey = ?2",
-            )?;
+            let mut stmt =
+                conn.prepare("SELECT id, created_at FROM events WHERE kind = ?1 AND pubkey = ?2")?;
             let rows: Vec<(String, i64)> = stmt
                 .query_map(params![ev.kind, ev.pubkey], |r| Ok((r.get(0)?, r.get(1)?)))?
                 .filter_map(|r| r.ok())
@@ -129,7 +132,9 @@ impl Db {
                    AND COALESCE((SELECT t.value FROM tags t WHERE t.event_id = e.id AND t.name = 'd' LIMIT 1), '') = ?3",
             )?;
             let rows: Vec<(String, i64)> = stmt
-                .query_map(params![ev.kind, ev.pubkey, d], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .query_map(params![ev.kind, ev.pubkey, d], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })?
                 .filter_map(|r| r.ok())
                 .collect();
             if rows.iter().any(|(_, t)| *t as u64 > ev.created_at) {
@@ -182,19 +187,20 @@ impl Db {
             );
             let mut args: Vec<SqlValue> = Vec::new();
 
-            let in_clause = |sql: &mut String, col: &str, values: &[String], args: &mut Vec<SqlValue>| {
-                if values.is_empty() {
-                    sql.push_str(" AND 0");
-                    return;
-                }
-                sql.push_str(&format!(
-                    " AND {col} IN ({})",
-                    vec!["?"; values.len()].join(",")
-                ));
-                for v in values {
-                    args.push(SqlValue::Text(v.clone()));
-                }
-            };
+            let in_clause =
+                |sql: &mut String, col: &str, values: &[String], args: &mut Vec<SqlValue>| {
+                    if values.is_empty() {
+                        sql.push_str(" AND 0");
+                        return;
+                    }
+                    sql.push_str(&format!(
+                        " AND {col} IN ({})",
+                        vec!["?"; values.len()].join(",")
+                    ));
+                    for v in values {
+                        args.push(SqlValue::Text(v.clone()));
+                    }
+                };
 
             if let Some(ids) = &f.ids {
                 in_clause(&mut sql, "id", ids, &mut args);
@@ -288,7 +294,11 @@ impl Db {
     pub fn whitelist_contains(&self, pubkey: &str) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
         Ok(conn
-            .query_row("SELECT 1 FROM whitelist WHERE pubkey = ?1", params![pubkey], |_| Ok(true))
+            .query_row(
+                "SELECT 1 FROM whitelist WHERE pubkey = ?1",
+                params![pubkey],
+                |_| Ok(true),
+            )
             .unwrap_or(false))
     }
 
@@ -366,13 +376,22 @@ impl Db {
         if uses >= max_uses {
             return Ok(Err("invite already used up".to_string()));
         }
-        conn.execute("UPDATE invites SET uses = uses + 1 WHERE code = ?1", params![code])?;
+        conn.execute(
+            "UPDATE invites SET uses = uses + 1 WHERE code = ?1",
+            params![code],
+        )?;
         Ok(Ok(()))
     }
 
     // ---- groups / members ----
 
-    pub fn group_create(&self, id: &str, name: &str, about: &str, created_by: &str) -> Result<bool> {
+    pub fn group_create(
+        &self,
+        id: &str,
+        name: &str,
+        about: &str,
+        created_by: &str,
+    ) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
         let n = conn.execute(
             "INSERT OR IGNORE INTO groups_ (id, name, about, created_by, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -381,13 +400,24 @@ impl Db {
         Ok(n > 0)
     }
 
-    pub fn group_update_meta(&self, id: &str, name: Option<&str>, about: Option<&str>) -> Result<()> {
+    pub fn group_update_meta(
+        &self,
+        id: &str,
+        name: Option<&str>,
+        about: Option<&str>,
+    ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         if let Some(name) = name {
-            conn.execute("UPDATE groups_ SET name = ?2 WHERE id = ?1", params![id, name])?;
+            conn.execute(
+                "UPDATE groups_ SET name = ?2 WHERE id = ?1",
+                params![id, name],
+            )?;
         }
         if let Some(about) = about {
-            conn.execute("UPDATE groups_ SET about = ?2 WHERE id = ?1", params![id, about])?;
+            conn.execute(
+                "UPDATE groups_ SET about = ?2 WHERE id = ?1",
+                params![id, about],
+            )?;
         }
         Ok(())
     }
@@ -420,8 +450,9 @@ impl Db {
 
     pub fn group_list(&self) -> Result<Vec<GroupRow>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt =
-            conn.prepare("SELECT id, name, about, created_by, created_at FROM groups_ ORDER BY created_at")?;
+        let mut stmt = conn.prepare(
+            "SELECT id, name, about, created_by, created_at FROM groups_ ORDER BY created_at",
+        )?;
         let rows = stmt.query_map([], |r| {
             Ok(GroupRow {
                 id: r.get(0)?,
@@ -482,7 +513,10 @@ impl Db {
                (SELECT event_id FROM tags WHERE (name = 'h' OR name = 'd') AND value = ?1)",
             params![group_id],
         )?;
-        conn.execute("DELETE FROM tags WHERE event_id NOT IN (SELECT id FROM events)", [])?;
+        conn.execute(
+            "DELETE FROM tags WHERE event_id NOT IN (SELECT id FROM events)",
+            [],
+        )?;
         Ok(())
     }
 

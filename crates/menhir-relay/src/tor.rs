@@ -72,7 +72,11 @@ pub async fn start(opts: TorOptions) -> Result<TorHandle> {
 
     let mut torrc = format!(
         "SocksPort {}\nDataDirectory {}\nLog notice stdout\n",
-        if opts.socks_port == 0 { "0".to_string() } else { format!("127.0.0.1:{}", opts.socks_port) },
+        if opts.socks_port == 0 {
+            "0".to_string()
+        } else {
+            format!("127.0.0.1:{}", opts.socks_port)
+        },
         state_dir.display(),
     );
     if let Some(target_port) = opts.hidden_service_target {
@@ -150,5 +154,9 @@ pub async fn start(opts: TorOptions) -> Result<TorHandle> {
         None
     };
 
-    Ok(TorHandle { child, onion, socks_port: opts.socks_port })
+    Ok(TorHandle {
+        child,
+        onion,
+        socks_port: opts.socks_port,
+    })
 }

@@ -28,7 +28,13 @@ pub struct EventTemplate {
 }
 
 /// Canonical NIP-01 serialization: `[0, pubkey, created_at, kind, tags, content]`.
-pub fn event_id(pubkey: &str, created_at: u64, kind: u32, tags: &[Vec<String>], content: &str) -> String {
+pub fn event_id(
+    pubkey: &str,
+    created_at: u64,
+    kind: u32,
+    tags: &[Vec<String>],
+    content: &str,
+) -> String {
     let canonical = serde_json::json!([0, pubkey, created_at, kind, tags, content]);
     let serialized = serde_json::to_string(&canonical).expect("canonical event serializes");
     let digest = Sha256::digest(serialized.as_bytes());
@@ -39,7 +45,13 @@ impl Event {
     /// Sign a template with the given keys, producing a complete event.
     pub fn sign(template: EventTemplate, keys: &Keys) -> anyhow::Result<Event> {
         let created_at = template.created_at.unwrap_or_else(crate::now);
-        let id = event_id(&keys.pk_hex, created_at, template.kind, &template.tags, &template.content);
+        let id = event_id(
+            &keys.pk_hex,
+            created_at,
+            template.kind,
+            &template.tags,
+            &template.content,
+        );
         let sig = keys.sign_digest(&hex::decode(&id)?)?;
         Ok(Event {
             id,
@@ -54,7 +66,13 @@ impl Event {
 
     /// Verify the event id matches its contents and the schnorr signature is valid.
     pub fn verify(&self) -> anyhow::Result<()> {
-        let expected = event_id(&self.pubkey, self.created_at, self.kind, &self.tags, &self.content);
+        let expected = event_id(
+            &self.pubkey,
+            self.created_at,
+            self.kind,
+            &self.tags,
+            &self.content,
+        );
         if expected != self.id {
             anyhow::bail!("event id mismatch");
         }
@@ -114,7 +132,12 @@ mod tests {
     fn tampered_content_fails_verification() {
         let keys = Keys::generate();
         let mut ev = Event::sign(
-            EventTemplate { kind: 9, tags: vec![], content: "original".into(), created_at: Some(1_700_000_000) },
+            EventTemplate {
+                kind: 9,
+                tags: vec![],
+                content: "original".into(),
+                created_at: Some(1_700_000_000),
+            },
             &keys,
         )
         .unwrap();
@@ -127,11 +150,19 @@ mod tests {
         let keys = Keys::generate();
         let other = Keys::generate();
         let ev = Event::sign(
-            EventTemplate { kind: 9, tags: vec![], content: "hi".into(), created_at: Some(1_700_000_000) },
+            EventTemplate {
+                kind: 9,
+                tags: vec![],
+                content: "hi".into(),
+                created_at: Some(1_700_000_000),
+            },
             &keys,
         )
         .unwrap();
-        let forged = Event { pubkey: other.pk_hex.clone(), ..ev.clone() };
+        let forged = Event {
+            pubkey: other.pk_hex.clone(),
+            ..ev.clone()
+        };
         assert!(forged.verify().is_err());
     }
 }

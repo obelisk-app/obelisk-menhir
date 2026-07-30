@@ -9,7 +9,11 @@ use menhir_relay::db::Db;
 use menhir_relay::{server, tor};
 
 #[derive(Parser)]
-#[command(name = "menhir-relay", version, about = "Obelisk Menhir relay — text channels over Nostr, at home behind Tor")]
+#[command(
+    name = "menhir-relay",
+    version,
+    about = "Obelisk Menhir relay — text channels over Nostr, at home behind Tor"
+)]
 struct Cli {
     /// Relay data directory (config, sqlite, keys, tor state).
     #[arg(long, global = true)]
@@ -87,7 +91,14 @@ async fn main() -> Result<()> {
     let data_dir = cli.data_dir.unwrap_or_else(default_data_dir);
 
     match cli.cmd {
-        Cmd::Serve { port, name, open, operator, tor: with_tor, socks_port } => {
+        Cmd::Serve {
+            port,
+            name,
+            open,
+            operator,
+            tor: with_tor,
+            socks_port,
+        } => {
             let mut cfg = load_config(&data_dir)?;
             if let Some(port) = port {
                 cfg.port = port;
@@ -106,8 +117,18 @@ async fn main() -> Result<()> {
             let (handle, st) = server::start(&data_dir, cfg.clone()).await?;
             println!("relay:   ws://127.0.0.1:{}", handle.port);
             println!("name:    {}", cfg.name);
-            println!("pubkey:  {}", menhir_core::keys::nip19_encode("npub", &st.keys.pk_hex));
-            println!("access:  {}", if cfg.open { "open" } else { "whitelist + invites" });
+            println!(
+                "pubkey:  {}",
+                menhir_core::keys::nip19_encode("npub", &st.keys.pk_hex)
+            );
+            println!(
+                "access:  {}",
+                if cfg.open {
+                    "open"
+                } else {
+                    "whitelist + invites"
+                }
+            );
 
             let tor_handle = if with_tor {
                 let th = tor::start(tor::TorOptions {
@@ -162,7 +183,10 @@ async fn main() -> Result<()> {
                 WhitelistCmd::Add { pubkey } => {
                     let hex = menhir_core::keys::pubkey_to_hex(&pubkey)?;
                     db.whitelist_add(&hex, "cli")?;
-                    println!("whitelisted {}", menhir_core::keys::nip19_encode("npub", &hex));
+                    println!(
+                        "whitelisted {}",
+                        menhir_core::keys::nip19_encode("npub", &hex)
+                    );
                 }
                 WhitelistCmd::Remove { pubkey } => {
                     let hex = menhir_core::keys::pubkey_to_hex(&pubkey)?;
@@ -184,19 +208,30 @@ async fn main() -> Result<()> {
                             inv.code,
                             inv.uses,
                             inv.max_uses,
-                            inv.expires_at.map(|e| e.to_string()).unwrap_or_else(|| "never".into())
+                            inv.expires_at
+                                .map(|e| e.to_string())
+                                .unwrap_or_else(|| "never".into())
                         );
                     }
                 }
-                InviteCmd::Create { max_uses, expires_hours } => {
+                InviteCmd::Create {
+                    max_uses,
+                    expires_hours,
+                } => {
                     let expires_at = expires_hours.map(|h| menhir_core::now() + h * 3600);
                     let invite = db.invite_create(max_uses, expires_at)?;
                     println!("{}", invite.code);
                     let cfg = load_config(&data_dir)?;
                     if let Some(onion) = tor::read_onion_hostname(&data_dir.join("tor")) {
-                        println!("share: obelisk://join?relay=ws://{onion}&invite={}", invite.code);
+                        println!(
+                            "share: obelisk://join?relay=ws://{onion}&invite={}",
+                            invite.code
+                        );
                     } else {
-                        println!("share: obelisk://join?relay=ws://127.0.0.1:{}&invite={}", cfg.port, invite.code);
+                        println!(
+                            "share: obelisk://join?relay=ws://127.0.0.1:{}&invite={}",
+                            cfg.port, invite.code
+                        );
                     }
                 }
             }
