@@ -21,14 +21,31 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = [] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-
-# Hosting + onion bridging are desktop-only: the Android app is a pure client.
-[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
-menhir-core = { path = "../../crates/menhir-core", features = ["client"] }
-menhir-relay = { path = "../../crates/menhir-relay" }
 tokio = { version = "1", features = ["full"] }
-tokio-socks = "0.5"
 anyhow = "1"
+
+# Hosting is desktop-only (Android would kill a long-running server anyway),
+# so the relay and the managed `tor` process are desktop dependencies.
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+menhir-relay = { path = "../../crates/menhir-relay" }
+tokio-socks = "0.5"
+
+# Reaching .onion servers works on every platform, by different means:
+# desktop drives the system Tor over SOCKS, mobile embeds arti (Tor in Rust)
+# in-process so there is nothing to install.
+[dependencies.menhir-core]
+path = "../../crates/menhir-core"
+features = ["client"]
+
+[target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
+arti-client = { version = "0.44", default-features = false, features = [
+    "tokio",
+    "rustls",
+    "onion-service-client",
+    "compression",
+] }
+tor-rtcompat = { version = "0.44", default-features = false, features = ["tokio", "rustls"] }
+futures = "0.3"
 
 [profile.release]
 strip = true

@@ -290,6 +290,11 @@ code {
   padding-bottom: calc(16px + var(--safe-b));
   z-index: 50;
 }
+
+/* Opened from inside another modal (share a QR from the host panel, scan one
+   from "add a server"). Equal z-index would let DOM order decide, and the
+   host panel is last in the document — so these must sit above. */
+#qr-modal, #scan-modal { z-index: 60; }
 .modal-card {
   width: 100%;
   max-width: 440px;
