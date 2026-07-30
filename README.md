@@ -24,14 +24,25 @@ This is the MVP implementation of the [Obelisk Desktop Tor Node spec](docs/tor-d
 
 ### Host a server (desktop app)
 
-1. Install Tor once: `brew install tor` (macOS) / `apt install tor` (Linux).
-2. Open Obelisk Menhir, log in with a Nostr key (or generate one).
+1. Install Tor once: `brew install tor` (macOS) / `apt install tor` (Linux). The app refuses to start hosting without it and shows you the command — a loopback-only server is no use for chatting with anyone else.
+2. Open Obelisk Menhir, log in (extension, remote signer, nsec, or a fresh key).
 3. Press **⌂ Host a server** → **Start hosting**.
-4. Tor bootstraps and prints your permanent onion address.
-5. Press **Create invite**, send the `obelisk://join?relay=ws://…onion&invite=CODE` link to a friend.
+4. Tor bootstraps and shows your permanent onion address.
+5. Press **Create invite** → **Show QR**, and let a friend scan it.
 6. Keep the app running — your computer *is* the server.
 
-Your friend pastes the link into **+ Add a server** and is whitelisted automatically. The onion address and all data persist across restarts (back up the app data directory — it contains the relay database and the onion key).
+Your friend scans the QR (or pastes the `obelisk://join?relay=ws://…onion&invite=CODE` link into **+ Add a server**) and is whitelisted automatically on redemption. The onion address and all data persist across restarts — back up the app data directory, it holds the relay database and the onion key.
+
+### Logging in
+
+| Method | Where the key lives |
+|---|---|
+| **Browser extension** (NIP-07) | in the extension — never reaches Menhir |
+| **Remote signer** (NIP-46) | in a bunker (Amber, nsec.app…). Scan the QR or paste a `bunker://` URI |
+| **Secret key** | on this device, in local storage |
+| **Create a new identity** | generated locally; you are shown the nsec once |
+
+`bunker://` sessions resume after a restart. A QR (`nostrconnect://`) session does not — it has no address to dial back out to, so you reconnect by scanning again.
 
 ### Run the relay headless (servers, Raspberry Pi, …)
 
@@ -121,11 +132,21 @@ docs/                  spec, protocol, notes
 
 ## MVP limitations (deliberate)
 
-- nsec is stored in the webview's localStorage (and `MENHIR_NSEC` for the CLI). Good enough for a proof of concept; a keychain integration comes later.
-- Tor is used from `PATH`, not bundled. Production installers should bundle it (see spec §Desktop packaging).
+- A pasted nsec is stored in the webview's localStorage (and `MENHIR_NSEC` for the CLI). Use a remote signer or an extension if that bothers you; a keychain integration comes later.
+- Tor is used from the system, not bundled. Production installers should bundle it (see spec §Desktop packaging).
 - No media, no formatting, no DMs, no voice, no reactions — text channels only.
 - Groups are open inside a whitelisted relay; fine-grained private groups come later.
-- Android is a client (hosting and `.onion` connections need the desktop app).
+- Android is a client. Hosting stays desktop-only, and `.onion` needs the desktop app's Tor — [docs/known-limitations.md](docs/known-limitations.md) covers the routes to on-device Tor (arti, Orbot, bundled tor-android).
+
+## Testing
+
+```bash
+cargo test                 # 22 tests: protocol units + relay integration over real websockets
+npm --prefix app/ui test   # 16 checks: boots the built UI in jsdom and asserts the wiring
+./scripts/demo.sh          # end-to-end: relay, channel, whitelist refusal, invite, history
+```
+
+The relay suite covers the security rules specifically — invite single-use, cross-channel smuggling, replayed moderation, auth replay, hex aliasing, and channel-id recycling. See [docs/PROTOCOL.md](docs/PROTOCOL.md) § *Rules that exist because they were attacks*.
 
 ## The Obelisk family
 
