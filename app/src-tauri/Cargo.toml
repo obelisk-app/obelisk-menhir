@@ -47,6 +47,11 @@ arti-client = { version = "0.44", default-features = false, features = [
 ] }
 tor-rtcompat = { version = "0.44", default-features = false, features = ["tokio", "rustls"] }
 futures = "0.3"
+# arti's directory cache is sqlite-backed, and the NDK ships no libsqlite3 to
+# link against. Depending on it here with "bundled" makes the transitive
+# rusqlite compile SQLite from source instead (needs the NDK's clang as CC —
+# scripts/build-android.sh exports it).
+rusqlite = { version = "0.37", features = ["bundled"] }
 
 [profile.release]
 strip = true

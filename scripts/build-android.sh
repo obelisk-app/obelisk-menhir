@@ -56,6 +56,22 @@ fi
 # ---- rust targets ----
 rustup target add aarch64-linux-android armv7-linux-androideabi >/dev/null 2>&1 || true
 
+# ---- C cross-toolchain ----
+# Some dependencies build C sources (SQLite, for arti's directory cache).
+# cc-rs looks for "aarch64-linux-android-clang", which the NDK does not ship
+# under that name, so point it at the real one.
+NDK_BIN="$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+if [[ -d "$NDK_BIN" ]]; then
+  export CC_aarch64_linux_android="$NDK_BIN/aarch64-linux-android24-clang"
+  export CXX_aarch64_linux_android="$NDK_BIN/aarch64-linux-android24-clang++"
+  export AR_aarch64_linux_android="$NDK_BIN/llvm-ar"
+  export RANLIB_aarch64_linux_android="$NDK_BIN/llvm-ranlib"
+  export CC_armv7_linux_androideabi="$NDK_BIN/armv7a-linux-androideabi24-clang"
+  export CXX_armv7_linux_androideabi="$NDK_BIN/armv7a-linux-androideabi24-clang++"
+  export AR_armv7_linux_androideabi="$NDK_BIN/llvm-ar"
+  export RANLIB_armv7_linux_androideabi="$NDK_BIN/llvm-ranlib"
+fi
+
 # ---- frontend ----
 (cd "$REPO_ROOT/app/ui" && npm install --no-audit --no-fund && npm run build)
 
