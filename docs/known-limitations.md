@@ -57,8 +57,27 @@ what separates this proof of concept from the "definition of done" there.
   large relay some authors will show as truncated npubs.
 - **Android cannot host or reach `.onion` servers.** Hosting is desktop-only
   by design; onion connections need the desktop app's Tor. An Android user
-  can only join clearnet relays (`ws://`, `wss://`). Next: bundle a Tor
-  library (e.g. arti) into the mobile build.
+  can only join clearnet relays (`ws://`, `wss://`).
+
+  There is a real path forward, in rough order of effort:
+
+  1. **[arti](https://gitlab.torproject.org/tpo/core/arti)** — Tor rewritten
+     in Rust, published as the `arti-client` crate. It builds for
+     `aarch64-linux-android`, and the app's Rust side already owns the
+     socket layer (`bridge_open`), so a mobile build would swap the managed
+     `tor` process for an in-process `arti-client` circuit and keep the same
+     loopback-bridge shape. This is the only option with no external
+     dependency, and it is where this should land.
+  2. **Orbot** (Tor Project's Android app) — expose a SOCKS5 proxy on
+     `127.0.0.1:9050` that Menhir dials. Almost no work, but the user must
+     install and run a second app.
+  3. **tor-android / kmp-tor** — ship the C Tor binary as a bundled `.so`
+     and drive it the way the desktop node manager does. Proven, but it
+     means carrying a native Tor build per ABI.
+
+  Hosting from a phone stays out of scope regardless: Android will kill a
+  long-running background service, so a phone-hosted server would be offline
+  most of the time.
 - **The Android build allows cleartext traffic.** Self-hosted relays are
   typically plain `ws://` on a LAN or behind Tor, so blocking cleartext (the
   Tauri default for release builds) would make the app useless for its own

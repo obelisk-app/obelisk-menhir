@@ -291,6 +291,245 @@ async fn oversized_tag_lists_are_rejected() {
     assert!(ok, "normal chat after rejection: {msg}");
 }
 
+/// Authorization reads one `h` tag; storage indexes every one. A second `h`
+/// would smuggle a message into a channel it was never authorized against.
+#[tokio::test]
+async fn a_second_h_tag_cannot_smuggle_into_another_channel() {
+    let operator = Keys::generate();
+    let (_handle, _st, url) = start_relay("smuggle", &operator, false).await;
+
+    let mut client = Client::connect(&url, None).await.unwrap();
+    client.auth(&operator, T).await.unwrap();
+    for id in ["sandbox", "announcements"] {
+        client
+            .publish(&create_channel(&operator, id, id), T)
+            .await
+            .unwrap();
+    }
+
+    let smuggled = Event::sign(
+        EventTemplate {
+            kind: kinds::CHAT,
+            tags: vec![
+                vec!["h".into(), "sandbox".into()],
+                vec!["h".into(), "announcements".into()],
+            ],
+            content: "not authorized here".into(),
+            created_at: None,
+        },
+        &operator,
+    )
+    .unwrap();
+    let (ok, msg) = client.publish(&smuggled, T).await.unwrap();
+    assert!(!ok, "multi-channel event must be refused");
+    assert!(msg.contains("only one channel"), "got: {msg}");
+
+    let leaked = client
+        .req_collect(
+            vec![Filter::new()
+                .kinds(vec![kinds::CHAT])
+                .tag("h", vec!["announcements".into()])],
+            T,
+        )
+        .await
+        .unwrap();
+    assert!(leaked.is_empty(), "nothing may reach #announcements");
+}
+
+/// Replaying a join must not undo a moderator's kick.
+#[tokio::test]
+async fn replayed_join_does_not_resurrect_a_kicked_member() {
+    let operator = Keys::generate();
+    let (_handle, st, url) = start_relay("replay", &operator, false).await;
+
+    let mut op = Client::connect(&url, None).await.unwrap();
+    op.auth(&operator, T).await.unwrap();
+    op.publish(&create_channel(&operator, "general", "General"), T)
+        .await
+        .unwrap();
+
+    let member = Keys::generate();
+    st.db.whitelist_add(&member.pk_hex, "test").unwrap();
+    let mut mem = Client::connect(&url, None).await.unwrap();
+    mem.auth(&member, T).await.unwrap();
+
+    let join = Event::sign(
+        EventTemplate {
+            kind: kinds::JOIN_REQUEST,
+            tags: vec![vec!["h".into(), "general".into()]],
+            content: String::new(),
+            created_at: None,
+        },
+        &member,
+    )
+    .unwrap();
+    assert!(mem.publish(&join, T).await.unwrap().0);
+    assert!(st
+        .db
+        .members("general")
+        .unwrap()
+        .iter()
+        .any(|(pk, _)| pk == &member.pk_hex));
+
+    // Admin kicks them.
+    let kick = Event::sign(
+        EventTemplate {
+            kind: kinds::REMOVE_USER,
+            tags: vec![
+                vec!["h".into(), "general".into()],
+                vec!["p".into(), member.pk_hex.clone()],
+            ],
+            content: String::new(),
+            created_at: None,
+        },
+        &operator,
+    )
+    .unwrap();
+    assert!(op.publish(&kick, T).await.unwrap().0);
+
+    // The byte-identical join is replayed.
+    let (ok, _) = mem.publish(&join, T).await.unwrap();
+    assert!(ok, "a replay is acknowledged, not an error");
+    assert!(
+        !st.db
+            .members("general")
+            .unwrap()
+            .iter()
+            .any(|(pk, _)| pk == &member.pk_hex),
+        "the kicked member must stay out"
+    );
+}
+
+/// A deleted channel id must not be reusable — re-creating it would hand
+/// admin of that name to whoever asks, and re-admit the purged events.
+#[tokio::test]
+async fn deleted_channel_ids_are_not_recycled() {
+    let operator = Keys::generate();
+    let (_handle, st, url) = start_relay("retire", &operator, false).await;
+
+    let mut op = Client::connect(&url, None).await.unwrap();
+    op.auth(&operator, T).await.unwrap();
+    op.publish(&create_channel(&operator, "general", "General"), T)
+        .await
+        .unwrap();
+    let abusive = chat(&operator, "general", "spam");
+    op.publish(&abusive, T).await.unwrap();
+
+    let delete = Event::sign(
+        EventTemplate {
+            kind: kinds::DELETE_GROUP,
+            tags: vec![vec!["h".into(), "general".into()]],
+            content: String::new(),
+            created_at: None,
+        },
+        &operator,
+    )
+    .unwrap();
+    assert!(op.publish(&delete, T).await.unwrap().0);
+
+    let squatter = Keys::generate();
+    st.db.whitelist_add(&squatter.pk_hex, "test").unwrap();
+    let mut sq = Client::connect(&url, None).await.unwrap();
+    sq.auth(&squatter, T).await.unwrap();
+    let (ok, msg) = sq
+        .publish(&create_channel(&squatter, "general", "General"), T)
+        .await
+        .unwrap();
+    assert!(!ok, "a purged channel id must not be reusable");
+    assert!(msg.contains("cannot be reused"), "got: {msg}");
+
+    // And the purged message cannot be re-published into it.
+    let (ok, _) = sq.publish(&abusive, T).await.unwrap();
+    assert!(!ok, "purged events must not come back");
+}
+
+/// An auth event names the relay it was signed for; one signed for a
+/// different host must not open a session here.
+#[tokio::test]
+async fn auth_event_is_bound_to_this_relay() {
+    let operator = Keys::generate();
+    let (_handle, _st, url) = start_relay("authbind", &operator, false).await;
+
+    let mut client = Client::connect(&url, None).await.unwrap();
+    let challenge = loop {
+        let v = client.recv(T).await.expect("challenge");
+        if v.get(0).and_then(Value::as_str) == Some("AUTH") {
+            break v.get(1).and_then(Value::as_str).unwrap().to_string();
+        }
+    };
+
+    let forwarded = Event::sign(
+        EventTemplate {
+            kind: kinds::CLIENT_AUTH,
+            tags: vec![
+                vec!["relay".into(), "wss://evil.example".into()],
+                vec!["challenge".into(), challenge.clone()],
+            ],
+            content: String::new(),
+            created_at: None,
+        },
+        &operator,
+    )
+    .unwrap();
+    client.send_json(&serde_json::json!(["AUTH", forwarded]));
+    let (ok, msg) = loop {
+        let v = client.recv(T).await.expect("ok");
+        if v.get(0).and_then(Value::as_str) == Some("OK") {
+            break (
+                v.get(2).and_then(Value::as_bool).unwrap_or(false),
+                v.get(3).and_then(Value::as_str).unwrap_or("").to_string(),
+            );
+        }
+    };
+    assert!(!ok, "auth naming another relay must be refused");
+    assert!(msg.contains("different relay"), "got: {msg}");
+
+    // The honest client (which names the host it dialled) still gets in.
+    let (ok, msg) = client.auth(&operator, T).await.unwrap();
+    assert!(ok, "normal auth still works: {msg}");
+}
+
+/// Uppercase hex is a second spelling of the same key. If it were accepted,
+/// it would land in the whitelist as a row that revocation can never match.
+#[tokio::test]
+async fn non_canonical_hex_pubkeys_are_rejected() {
+    let operator = Keys::generate();
+    let (_handle, st, url) = start_relay("hexcase", &operator, false).await;
+
+    let stranger = Keys::generate();
+    let invite = st.db.invite_create(1, None).unwrap();
+
+    let mut client = Client::connect(&url, None).await.unwrap();
+    let mut redeem = Event::sign(
+        EventTemplate {
+            kind: kinds::INVITE_REDEEM,
+            tags: vec![],
+            content: invite.code.clone(),
+            created_at: None,
+        },
+        &stranger,
+    )
+    .unwrap();
+    // Same key, different spelling — and a matching id so only the case differs.
+    redeem.pubkey = stranger.pk_hex.to_uppercase();
+    redeem.id = menhir_core::event::event_id(
+        &redeem.pubkey,
+        redeem.created_at,
+        redeem.kind,
+        &redeem.tags,
+        &redeem.content,
+    );
+
+    let (ok, _) = client.publish(&redeem, T).await.unwrap();
+    assert!(!ok, "non-canonical hex must not authenticate");
+    assert!(
+        !st.db
+            .whitelist_contains(&stranger.pk_hex.to_uppercase())
+            .unwrap(),
+        "no aliased row may reach the whitelist"
+    );
+}
+
 #[tokio::test]
 async fn live_subscription_delivers_messages() {
     let operator = Keys::generate();

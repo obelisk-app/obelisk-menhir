@@ -14,6 +14,10 @@ use crate::HostStatus;
 
 const SOCKS_PORT: u16 = 39050;
 
+const TOR_MISSING: &str = "Tor is not installed, so nobody outside this computer could reach your \
+                           server. Install it first — macOS: brew install tor — Linux: apt install \
+                           tor — then start hosting again.";
+
 #[derive(Default)]
 pub struct NodeInner {
     relay: Option<server::RelayHandle>,
@@ -97,6 +101,12 @@ pub async fn host_start(
     let mut inner = state.0.lock().await;
     if inner.relay.is_some() {
         return Ok(status_of(&inner, &dir));
+    }
+
+    // Refuse up front rather than starting a relay nobody else can reach: a
+    // loopback-only server is useless for chatting with other people.
+    if use_tor && !tor::tor_available() {
+        return Err(TOR_MISSING.to_string());
     }
 
     let operator = pubkey_to_hex(&operator_npub).map_err(|e| e.to_string())?;

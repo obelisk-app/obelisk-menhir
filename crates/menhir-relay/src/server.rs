@@ -40,6 +40,9 @@ struct ConnCtx {
     authed: Option<String>,
     challenge: String,
     subs: HashMap<String, Vec<Filter>>,
+    /// Host this connection was dialled on, used to bind NIP-42 auth to this
+    /// endpoint so a signed auth event cannot be replayed against another relay.
+    host: Option<String>,
 }
 
 pub struct RelayHandle {
@@ -88,9 +91,14 @@ async fn root(State(st): State<Shared>, req: Request) -> Response {
         .map(|v| v.as_bytes().eq_ignore_ascii_case(b"websocket"))
         .unwrap_or(false);
     if wants_ws {
+        let host = req
+            .headers()
+            .get("host")
+            .and_then(|v| v.to_str().ok())
+            .map(|h| h.to_ascii_lowercase());
         let (mut parts, _body) = req.into_parts();
         match WebSocketUpgrade::from_request_parts(&mut parts, &st).await {
-            Ok(ws) => ws.on_upgrade(move |socket| handle_socket(socket, st)),
+            Ok(ws) => ws.on_upgrade(move |socket| handle_socket(socket, st, host)),
             Err(rejection) => rejection.into_response(),
         }
     } else {
@@ -123,12 +131,13 @@ fn nip11(st: &RelayState) -> Response {
         .into_response()
 }
 
-async fn handle_socket(mut socket: WebSocket, st: Shared) {
+async fn handle_socket(mut socket: WebSocket, st: Shared, host: Option<String>) {
     let mut rx = st.broadcast.subscribe();
     let mut ctx = ConnCtx {
         authed: None,
         challenge: hex::encode(rand::random::<[u8; 16]>()),
         subs: HashMap::new(),
+        host,
     };
     if !st.cfg.open {
         let hello = json!(["AUTH", ctx.challenge]).to_string();
@@ -289,6 +298,17 @@ fn handle_auth(st: &RelayState, ctx: &mut ConnCtx, ev: Event) -> Vec<Value> {
     if ev.created_at.abs_diff(now) > AUTH_FRESHNESS_SECS {
         return ok(false, "invalid: auth event is not fresh", &ev.id);
     }
+    // Bind the auth event to this endpoint. Without it, a relay the user
+    // visits can forward its own challenge, collect the signed reply, and
+    // replay it here to open a session as that user — the signature alone
+    // says nothing about which relay it was meant for.
+    if let Some(host) = &ctx.host {
+        match ev.first_tag("relay").map(url_host) {
+            Some(Some(claimed)) if claimed == host_only(host) => {}
+            Some(_) => return ok(false, "invalid: auth event names a different relay", &ev.id),
+            None => return ok(false, "invalid: auth event needs a relay tag", &ev.id),
+        }
+    }
     if is_allowed(st, &ev.pubkey) {
         ctx.authed = Some(ev.pubkey.clone());
         ok(true, "welcome", &ev.id)
@@ -299,6 +319,27 @@ fn handle_auth(st: &RelayState, ctx: &mut ConnCtx, ev: Event) -> Vec<Value> {
             &ev.id,
         )
     }
+}
+
+/// Hostname of a `host[:port]` pair, lowercased and without the port.
+fn host_only(host: &str) -> &str {
+    match host.rfind(':') {
+        // Leave IPv6 literals ("[::1]:4869" / "::1") alone.
+        Some(i) if !host.contains(']') && !host[..i].contains(':') => &host[..i],
+        _ => host,
+    }
+}
+
+/// Hostname of a ws:// or wss:// URL, lowercased and without the port.
+fn url_host(url: &str) -> Option<String> {
+    let rest = url
+        .strip_prefix("wss://")
+        .or_else(|| url.strip_prefix("ws://"))?;
+    let hostport = rest.split('/').next()?;
+    if hostport.is_empty() {
+        return None;
+    }
+    Some(host_only(hostport).to_ascii_lowercase())
 }
 
 fn is_allowed(st: &RelayState, pubkey: &str) -> bool {
@@ -368,6 +409,30 @@ fn handle_event(st: &RelayState, ctx: &mut ConnCtx, ev: Event) -> Vec<Value> {
             "restricted: this relay accepts text-channel events only".into(),
         );
     }
+    // Authorization reads one `h` tag but storage indexes every one of them,
+    // so a second `h` would let a message authorized against a channel the
+    // sender owns be delivered by a subscription to a channel they do not.
+    if ev.tag_values("h").len() > 1 {
+        return ok(false, "invalid: an event may name only one channel".into());
+    }
+    // Same reasoning for `d`: it addresses the relay-signed channel metadata,
+    // and clients have no business writing that index.
+    if !ev.tag_values("d").is_empty() {
+        return ok(false, "invalid: d tags are reserved for the relay".into());
+    }
+    // Replays must not re-run side effects (a re-sent join would silently
+    // re-add a member an admin had just removed), so refuse a known id up
+    // front rather than after the membership tables have been touched.
+    if !kinds::is_ephemeral(ev.kind) {
+        match st.db.has_event(&ev.id) {
+            Ok(true) => return ok(true, "duplicate: already have this event".into()),
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, "duplicate check failed");
+                return ok(false, "error: storage failure".into());
+            }
+        }
+    }
     if ev.content.len() > st.cfg.max_content_len {
         return ok(
             false,
@@ -411,6 +476,11 @@ fn handle_event(st: &RelayState, ctx: &mut ConnCtx, ev: Event) -> Vec<Value> {
                     .to_string();
                 if !valid_group_id(&group_id) {
                     return Err("invalid: channel id must be 1-64 chars of a-z 0-9 - _".into());
+                }
+                if st.db.group_is_retired(&group_id).map_err(db_err)? {
+                    return Err(
+                        "restricted: that channel id was deleted and cannot be reused".into(),
+                    );
                 }
                 let name = ev
                     .first_tag("name")
@@ -547,7 +617,13 @@ pub fn group_meta_events(st: &RelayState, group_id: &str) -> anyhow::Result<Vec<
         return Ok(vec![]);
     };
     let members = st.db.members(group_id)?;
-    let now = menhir_core::now();
+    // Strictly newer than whatever we published last for this channel:
+    // membership can change several times inside one second, and equal
+    // timestamps would leave which version survives up to the id tie-break.
+    let now = match st.db.max_created_at_for_d(&st.keys.pk_hex, group_id)? {
+        Some(last) => menhir_core::now().max(last + 1),
+        None => menhir_core::now(),
+    };
 
     let mut meta_tags = vec![
         vec!["d".to_string(), group.id.clone()],

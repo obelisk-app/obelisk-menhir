@@ -91,6 +91,10 @@ impl Db {
                 role TEXT NOT NULL DEFAULT 'member',
                 added_at INTEGER NOT NULL,
                 PRIMARY KEY (group_id, pubkey)
+            );
+            CREATE TABLE IF NOT EXISTS retired_groups (
+                id TEXT PRIMARY KEY,
+                retired_at INTEGER NOT NULL
             );",
         )?;
         Ok(Db {
@@ -100,10 +104,24 @@ impl Db {
 
     // ---- events ----
 
-    pub fn insert_event(&self, ev: &Event) -> Result<StoreResult> {
+    pub fn has_event(&self, id: &str) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row("SELECT 1 FROM events WHERE id = ?1", params![id], |_| {
+                Ok(true)
+            })
+            .unwrap_or(false))
+    }
 
-        let exists: bool = conn
+    pub fn insert_event(&self, ev: &Event) -> Result<StoreResult> {
+        let mut conn = self.conn.lock().unwrap();
+        // One transaction: replacement deletes the old row before writing the
+        // new one, so a failure in between would otherwise leave a profile or
+        // channel metadata simply gone, and a half-written tag index makes an
+        // event unfindable by the tags it declares.
+        let tx = conn.transaction()?;
+
+        let exists: bool = tx
             .query_row("SELECT 1 FROM events WHERE id = ?1", params![ev.id], |_| {
                 Ok(true)
             })
@@ -112,45 +130,49 @@ impl Db {
             return Ok(StoreResult::Duplicate);
         }
 
-        // Replaceable semantics: newest (created_at, then id) wins.
-        let replaced_ids: Vec<String> = if kinds::is_replaceable(ev.kind) {
+        // Replaceable semantics: newest wins; on an equal created_at NIP-01
+        // breaks the tie by keeping the lowest id, so every relay fed the same
+        // pair converges on the same survivor regardless of arrival order.
+        let existing: Vec<(String, i64)> = if kinds::is_replaceable(ev.kind) {
             let mut stmt =
-                conn.prepare("SELECT id, created_at FROM events WHERE kind = ?1 AND pubkey = ?2")?;
-            let rows: Vec<(String, i64)> = stmt
+                tx.prepare("SELECT id, created_at FROM events WHERE kind = ?1 AND pubkey = ?2")?;
+            let rows = stmt
                 .query_map(params![ev.kind, ev.pubkey], |r| Ok((r.get(0)?, r.get(1)?)))?
                 .filter_map(|r| r.ok())
                 .collect();
-            if rows.iter().any(|(_, t)| *t as u64 > ev.created_at) {
-                return Ok(StoreResult::Stale);
-            }
-            rows.into_iter().map(|(id, _)| id).collect()
+            rows
         } else if kinds::is_addressable(ev.kind) {
             let d = ev.first_tag("d").unwrap_or("").to_string();
-            let mut stmt = conn.prepare(
+            let mut stmt = tx.prepare(
                 "SELECT e.id, e.created_at FROM events e
                  WHERE e.kind = ?1 AND e.pubkey = ?2
                    AND COALESCE((SELECT t.value FROM tags t WHERE t.event_id = e.id AND t.name = 'd' LIMIT 1), '') = ?3",
             )?;
-            let rows: Vec<(String, i64)> = stmt
+            let rows = stmt
                 .query_map(params![ev.kind, ev.pubkey, d], |r| {
                     Ok((r.get(0)?, r.get(1)?))
                 })?
                 .filter_map(|r| r.ok())
                 .collect();
-            if rows.iter().any(|(_, t)| *t as u64 > ev.created_at) {
-                return Ok(StoreResult::Stale);
-            }
-            rows.into_iter().map(|(id, _)| id).collect()
+            rows
         } else {
             vec![]
         };
 
-        for id in &replaced_ids {
-            conn.execute("DELETE FROM events WHERE id = ?1", params![id])?;
-            conn.execute("DELETE FROM tags WHERE event_id = ?1", params![id])?;
+        let superseded = |(id, t): &(String, i64)| {
+            let t = *t as u64;
+            t > ev.created_at || (t == ev.created_at && id.as_str() < ev.id.as_str())
+        };
+        if existing.iter().any(superseded) {
+            return Ok(StoreResult::Stale);
         }
 
-        conn.execute(
+        for (id, _) in &existing {
+            tx.execute("DELETE FROM events WHERE id = ?1", params![id])?;
+            tx.execute("DELETE FROM tags WHERE event_id = ?1", params![id])?;
+        }
+
+        tx.execute(
             "INSERT INTO events (id, pubkey, created_at, kind, tags, content, sig)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
@@ -166,14 +188,34 @@ impl Db {
         for tag in &ev.tags {
             if let (Some(name), Some(value)) = (tag.first(), tag.get(1)) {
                 if name.len() == 1 {
-                    conn.execute(
+                    tx.execute(
                         "INSERT INTO tags (event_id, name, value) VALUES (?1, ?2, ?3)",
                         params![ev.id, name, value],
                     )?;
                 }
             }
         }
+        tx.commit()?;
         Ok(StoreResult::Stored)
+    }
+
+    /// Newest `created_at` among this author's addressable events carrying
+    /// `d = d_tag`. Used to keep relay-generated channel metadata strictly
+    /// increasing: several updates can land inside one second, and the
+    /// equal-timestamp tie-break would otherwise keep an arbitrary one.
+    pub fn max_created_at_for_d(&self, pubkey: &str, d_tag: &str) -> Result<Option<u64>> {
+        let conn = self.conn.lock().unwrap();
+        let newest: Option<i64> = conn
+            .query_row(
+                "SELECT MAX(e.created_at) FROM events e
+                 WHERE e.pubkey = ?1
+                   AND EXISTS (SELECT 1 FROM tags t
+                               WHERE t.event_id = e.id AND t.name = 'd' AND t.value = ?2)",
+                params![pubkey, d_tag],
+                |r| r.get(0),
+            )
+            .unwrap_or(None);
+        Ok(newest.map(|t| t as u64))
     }
 
     pub fn query(&self, filters: &[Filter]) -> Result<Vec<Event>> {
@@ -426,7 +468,26 @@ impl Db {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM groups_ WHERE id = ?1", params![id])?;
         conn.execute("DELETE FROM members WHERE group_id = ?1", params![id])?;
+        conn.execute(
+            "INSERT OR IGNORE INTO retired_groups (id, retired_at) VALUES (?1, ?2)",
+            params![id, menhir_core::now() as i64],
+        )?;
         Ok(())
+    }
+
+    /// True once a channel id has been deleted. Ids are never recycled:
+    /// whoever creates a channel becomes its admin, so a freed id would let
+    /// the next caller take over the name an admin just purged — and re-post
+    /// the purged events, whose signatures remain perfectly valid.
+    pub fn group_is_retired(&self, id: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row(
+                "SELECT 1 FROM retired_groups WHERE id = ?1",
+                params![id],
+                |_| Ok(true),
+            )
+            .unwrap_or(false))
     }
 
     pub fn group_get(&self, id: &str) -> Result<Option<GroupRow>> {

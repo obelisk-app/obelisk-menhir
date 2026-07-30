@@ -27,6 +27,13 @@ pub struct EventTemplate {
     pub created_at: Option<u64>,
 }
 
+/// True when `s` is exactly `bytes` worth of lowercase hex.
+pub fn is_canonical_hex(s: &str, bytes: usize) -> bool {
+    s.len() == bytes * 2
+        && s.bytes()
+            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+}
+
 /// Canonical NIP-01 serialization: `[0, pubkey, created_at, kind, tags, content]`.
 pub fn event_id(
     pubkey: &str,
@@ -65,7 +72,22 @@ impl Event {
     }
 
     /// Verify the event id matches its contents and the schnorr signature is valid.
+    ///
+    /// Hex fields must be **lowercase** (NIP-01's canonical form). `hex::decode`
+    /// is case-insensitive, so without this one key would have many valid
+    /// spellings that all verify — and since SQLite compares TEXT bytewise,
+    /// a pubkey stored in one spelling is invisible to a lookup in another.
+    /// That turns whitelist revocation into a silent no-op.
     pub fn verify(&self) -> anyhow::Result<()> {
+        if !is_canonical_hex(&self.id, 32) {
+            anyhow::bail!("event id must be 64 lowercase hex characters");
+        }
+        if !is_canonical_hex(&self.pubkey, 32) {
+            anyhow::bail!("pubkey must be 64 lowercase hex characters");
+        }
+        if !is_canonical_hex(&self.sig, 64) {
+            anyhow::bail!("signature must be 128 lowercase hex characters");
+        }
         let expected = event_id(
             &self.pubkey,
             self.created_at,

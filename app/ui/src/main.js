@@ -1,30 +1,48 @@
-// Obelisk Menhir — vanilla JS Nostr text-channel client.
-// Identity: nsec in localStorage (MVP). Transport: raw NIP-01 websocket.
-// Under Tauri, hosting + .onion bridging are provided by Rust commands.
+// Obelisk Menhir — Nostr text-channel client.
+// Transport: raw NIP-01 websocket. Signing: nsec / NIP-07 / NIP-46 (see signer.js).
+// Under Tauri, hosting and .onion bridging come from Rust commands.
 
-import { generateSecretKey, getPublicKey, finalizeEvent } from 'nostr-tools/pure';
 import * as nip19 from 'nostr-tools/nip19';
+import { NsecSigner, Nip07Signer, RemoteSigner, restoreSigner } from './signer.js';
+import { renderQR, startScanner } from './qr.js';
 
-// ---------- small helpers ----------
+// ---------- helpers ----------
 
 const $ = (id) => document.getElementById(id);
 const show = (el) => el.classList.remove('hidden');
 const hide = (el) => el.classList.add('hidden');
+const setText = (el, t) => { el.textContent = t; };
 
-function hexToBytes(hex) {
-  const out = new Uint8Array(hex.length / 2);
-  for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.substr(i * 2, 2), 16);
-  return out;
-}
-function bytesToHex(bytes) {
-  return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
-}
+const NOSTR_CONNECT_RELAYS = ['wss://relay.nsec.app', 'wss://relay.damus.io', 'wss://nos.lol'];
+
 function shortNpub(pkHex) {
   const npub = nip19.npubEncode(pkHex);
-  return npub.slice(0, 12) + '…' + npub.slice(-4);
+  return npub.slice(0, 10) + '…' + npub.slice(-4);
 }
+
 function fmtTime(ts) {
   return new Date(ts * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand('copy');
+    ta.remove();
+  }
+}
+
+function flash(btn, label = 'Copied') {
+  const original = btn.textContent;
+  btn.textContent = label;
+  setTimeout(() => { btn.textContent = original; }, 1200);
 }
 
 const tauriInvoke = window.__TAURI__?.core?.invoke ?? null;
@@ -39,8 +57,7 @@ class RelayConn {
     this.okWaiters = new Map();
     this.subCounter = 0;
     this.dead = false;
-    this.onauthchallenge = null; // (challenge) => {}
-    this.onstatus = null; // (text) => {}
+    this.onauthchallenge = null;
     this.onclose = null;
   }
 
@@ -48,9 +65,9 @@ class RelayConn {
     return new Promise((resolve, reject) => {
       const ws = new WebSocket(this.wsUrl);
       this.ws = ws;
-      const failTimer = setTimeout(() => { ws.close(); reject(new Error('connection timed out')); }, 15000);
+      const failTimer = setTimeout(() => { ws.close(); reject(new Error('connection timed out')); }, 20000);
       ws.onopen = () => { clearTimeout(failTimer); resolve(); };
-      ws.onerror = () => { clearTimeout(failTimer); reject(new Error('websocket error')); };
+      ws.onerror = () => { clearTimeout(failTimer); reject(new Error('could not reach the relay')); };
       ws.onclose = () => { if (!this.dead) { this.dead = true; this.onclose?.(); } };
       ws.onmessage = (e) => this.handleMessage(e.data);
     });
@@ -67,22 +84,27 @@ class RelayConn {
     else if (type === 'OK') {
       const waiter = this.okWaiters.get(a);
       if (waiter) { this.okWaiters.delete(a); waiter({ ok: b, msg: c || '' }); }
-    } else if (type === 'NOTICE') console.warn('[relay notice]', a);
+    } else if (type === 'NOTICE') console.warn('[relay]', a);
   }
 
   send(arr) {
     if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify(arr));
   }
 
-  publish(event, timeoutMs = 10000) {
+  waitForOk(eventId, timeoutMs = 15000) {
     return new Promise((resolve) => {
       const timer = setTimeout(() => {
-        this.okWaiters.delete(event.id);
+        this.okWaiters.delete(eventId);
         resolve({ ok: false, msg: 'timed out waiting for the relay' });
       }, timeoutMs);
-      this.okWaiters.set(event.id, (r) => { clearTimeout(timer); resolve(r); });
-      this.send(['EVENT', event]);
+      this.okWaiters.set(eventId, (r) => { clearTimeout(timer); resolve(r); });
     });
+  }
+
+  publish(event, timeoutMs = 15000) {
+    const waiter = this.waitForOk(event.id, timeoutMs);
+    this.send(['EVENT', event]);
+    return waiter;
   }
 
   req(filters, handlers) {
@@ -106,60 +128,46 @@ class RelayConn {
 
 // ---------- state ----------
 
-let sk = null; // Uint8Array
-let pkHex = null;
+let signer = null;
 let servers = JSON.parse(localStorage.getItem('menhir-servers') || '[]');
-let activeServer = null; // entry of servers
+let activeServer = null;
 let conn = null;
-let channels = new Map(); // id -> {id, name, about}
+let channels = new Map();
 let activeChannel = null;
 let msgSubId = null;
-let profiles = new Map(); // pubkey -> display name
+let profiles = new Map();
 let reconnectTimer = null;
+let myProfile = { name: '', about: '' };
+let ncSession = null;
+let stopScanner = null;
 
-function saveServers() {
-  localStorage.setItem('menhir-servers', JSON.stringify(servers));
+const saveServers = () => localStorage.setItem('menhir-servers', JSON.stringify(servers));
+
+function persistSigner() {
+  const blob = signer?.persist?.();
+  if (blob) localStorage.setItem('menhir-signer', JSON.stringify(blob));
+  else localStorage.removeItem('menhir-signer');
 }
 
-// ---------- login ----------
-
-function tryRestoreIdentity() {
-  const stored = localStorage.getItem('menhir-sk-hex');
-  if (!stored) return false;
-  try {
-    sk = hexToBytes(stored);
-    pkHex = getPublicKey(sk);
-    return true;
-  } catch { return false; }
-}
-
-function loginWith(input) {
-  const trimmed = input.trim();
-  let bytes;
-  if (trimmed.startsWith('nsec1')) {
-    const decoded = nip19.decode(trimmed);
-    if (decoded.type !== 'nsec') throw new Error('that is not an nsec key');
-    bytes = decoded.data;
-  } else if (/^[0-9a-fA-F]{64}$/.test(trimmed)) {
-    bytes = hexToBytes(trimmed.toLowerCase());
-  } else {
-    throw new Error('paste an nsec1… key or 64 hex characters');
-  }
-  sk = bytes;
-  pkHex = getPublicKey(sk);
-  localStorage.setItem('menhir-sk-hex', bytesToHex(sk));
-}
-
-function signEvent(kind, tags, content) {
-  return finalizeEvent({ kind, tags, content, created_at: Math.floor(Date.now() / 1000) }, sk);
-}
-
-// ---------- server connection flow ----------
+// ---------- connection flow ----------
 
 async function resolveWsUrl(url) {
   if (!url.includes('.onion')) return url;
   if (!tauriInvoke) throw new Error('.onion servers need the Menhir desktop app (it runs Tor for you)');
   return await tauriInvoke('bridge_open', { onionUrl: url });
+}
+
+function isUnprotectedCleartext(url) {
+  if (!url.startsWith('ws://')) return false;
+  const host = url.slice(5).split('/')[0].split(':')[0];
+  if (host.endsWith('.onion')) return false; // Tor encrypts end to end
+  return !['127.0.0.1', 'localhost', '::1'].includes(host);
+}
+
+function setServerStatus(text, isError) {
+  const el = $('server-status');
+  el.textContent = text;
+  el.style.color = isError ? 'var(--lc-red)' : '';
 }
 
 async function selectServer(entry) {
@@ -173,58 +181,73 @@ async function selectServer(entry) {
   renderRail();
   renderChannels();
   clearChat('Connecting…');
-  $('server-name').textContent = entry.label || entry.url;
+  setText($('server-name'), entry.label || entry.url);
+  show($('server-qr-btn'));
   setServerStatus('connecting…');
+  if (isMobile()) showPane('channels');
 
   let wsUrl;
   try {
     wsUrl = await resolveWsUrl(entry.url);
   } catch (e) {
     setServerStatus(String(e.message || e), true);
+    clearChat(String(e.message || e));
     return;
   }
 
   const c = new RelayConn(entry.url, wsUrl);
   conn = c;
-  let authed = false;
-  let authTimer = null;
+  let ready = false;
+  let graceTimer = null;
 
   const onReady = () => {
-    if (authed || conn !== c) return;
-    authed = true;
+    if (ready || conn !== c) return;
+    ready = true;
     setServerStatus(isUnprotectedCleartext(entry.url) ? 'online — unencrypted (ws://)' : 'online');
     openMetaSubscriptions(c);
   };
 
   c.onauthchallenge = async (challenge) => {
-    clearTimeout(authTimer);
+    clearTimeout(graceTimer);
     if (conn !== c) return;
-    setServerStatus('authenticating…');
-    const authEvent = signEvent(22242, [['relay', entry.url], ['challenge', challenge]], '');
-    c.send(['AUTH', authEvent]);
-    const result = await new Promise((resolve) => {
-      const t = setTimeout(() => resolve({ ok: false, msg: 'auth timed out' }), 10000);
-      c.okWaiters.set(authEvent.id, (r) => { clearTimeout(t); resolve(r); });
-    });
-    if (result.ok) return onReady();
-    if (entry.invite) {
-      setServerStatus('redeeming invite…');
-      const redeem = signEvent(20284, [], entry.invite);
-      const r = await c.publish(redeem);
-      if (r.ok) {
-        entry.invite = null; // consumed — whitelisting persists on the relay
-        saveServers();
-        return onReady();
+    try {
+      setServerStatus('authenticating…');
+      // The relay tag must name the endpoint actually dialled: the relay
+      // compares it against the connection's Host header to stop a signed
+      // auth event being replayed against a different relay.
+      const authEvent = await signer.sign({
+        kind: 22242,
+        tags: [['relay', wsUrl], ['challenge', challenge]],
+        content: '',
+      });
+      const waiter = c.waitForOk(authEvent.id);
+      c.send(['AUTH', authEvent]);
+      const result = await waiter;
+      if (result.ok) return onReady();
+
+      if (entry.invite) {
+        setServerStatus('redeeming invite…');
+        const redeem = await signer.sign({ kind: 20284, tags: [], content: entry.invite });
+        const r = await c.publish(redeem);
+        if (r.ok) {
+          entry.invite = null; // consumed — the whitelisting persists on the relay
+          saveServers();
+          return onReady();
+        }
+        setServerStatus('invite rejected: ' + r.msg, true);
+        clearChat('This invite was rejected: ' + r.msg);
+        return;
       }
-      setServerStatus('invite rejected: ' + r.msg, true);
-      return;
+      setServerStatus('access denied: ' + result.msg, true);
+      clearChat('This server did not let you in: ' + result.msg + '\n\nAsk the operator for an invite link.');
+    } catch (e) {
+      setServerStatus('sign failed: ' + (e.message || e), true);
     }
-    setServerStatus('access denied: ' + result.msg, true);
   };
 
   c.onclose = () => {
     if (conn !== c) return;
-    setServerStatus('disconnected — retrying in 4s', true);
+    setServerStatus('disconnected — retrying', true);
     reconnectTimer = setTimeout(() => { if (activeServer === entry) selectServer(entry); }, 4000);
   };
 
@@ -233,12 +256,13 @@ async function selectServer(entry) {
   } catch (e) {
     if (conn === c) {
       setServerStatus('unreachable: ' + (e.message || e), true);
+      clearChat('Could not reach this server. Is the host online?');
       reconnectTimer = setTimeout(() => { if (activeServer === entry) selectServer(entry); }, 6000);
     }
     return;
   }
   // Open relays send no AUTH challenge — proceed after a short grace period.
-  authTimer = setTimeout(onReady, 1200);
+  graceTimer = setTimeout(onReady, 1500);
 }
 
 function openMetaSubscriptions(c) {
@@ -246,14 +270,22 @@ function openMetaSubscriptions(c) {
     onevent: (ev) => {
       const id = ev.tags.find((t) => t[0] === 'd')?.[1];
       if (!id) return;
-      const name = ev.tags.find((t) => t[0] === 'name')?.[1] || id;
-      const about = ev.tags.find((t) => t[0] === 'about')?.[1] || '';
-      channels.set(id, { id, name, about });
+      channels.set(id, {
+        id,
+        name: ev.tags.find((t) => t[0] === 'name')?.[1] || id,
+        about: ev.tags.find((t) => t[0] === 'about')?.[1] || '',
+      });
       renderChannels();
     },
     oneose: () => {
       renderChannels();
-      if (!activeChannel && channels.size > 0) selectChannel([...channels.keys()][0]);
+      if (channels.size === 0) {
+        clearChat('No channels here yet.' + (conn ? '\n\nCreate the first one with “+ new channel”.' : ''));
+      } else if (!activeChannel && !isMobile()) {
+        selectChannel([...channels.keys()][0]);
+      } else if (!activeChannel) {
+        clearChat('Pick a channel.');
+      }
     },
   });
   c.req([{ kinds: [0], limit: 500 }], {
@@ -261,8 +293,14 @@ function openMetaSubscriptions(c) {
       try {
         const meta = JSON.parse(ev.content);
         const name = meta.display_name || meta.name;
-        if (name) profiles.set(ev.pubkey, name);
-        renderMessagesAuthors();
+        if (name) {
+          profiles.set(ev.pubkey, name);
+          if (ev.pubkey === signer.pubkey) {
+            myProfile = { name, about: meta.about || '' };
+            setText($('me-name'), name);
+          }
+          renderMessageAuthors();
+        }
       } catch {}
     },
   });
@@ -270,25 +308,15 @@ function openMetaSubscriptions(c) {
 
 // ---------- channels & messages ----------
 
-/// True for a plain-ws server that is neither loopback nor an onion address —
-/// i.e. one whose traffic crosses a network in the clear.
-function isUnprotectedCleartext(url) {
-  if (!url.startsWith('ws://')) return false;
-  const host = url.slice(5).split('/')[0].split(':')[0];
-  if (host.endsWith('.onion')) return false; // Tor encrypts end to end
-  return !['127.0.0.1', 'localhost', '::1'].includes(host);
-}
-
 function selectChannel(id) {
   if (!conn) return;
   if (msgSubId) conn.closeSub(msgSubId);
   activeChannel = id;
   renderChannels();
-  const meta = channels.get(id);
-  $('chat-title').textContent = '#' + (meta?.name || id);
+  setText($('chat-title'), '#' + (channels.get(id)?.name || id));
   clearChat();
   show($('composer'));
-  if (window.innerWidth <= 720) $('channel-pane').classList.add('collapsed');
+  if (isMobile()) showPane('chat');
 
   const seen = new Set();
   let eosed = false;
@@ -303,7 +331,8 @@ function selectChannel(id) {
     oneose: () => {
       eosed = true;
       buffer.sort((a, b) => a.created_at - b.created_at);
-      for (const ev of buffer) appendMessage(ev, false);
+      if (buffer.length === 0) clearChat('No messages yet — say something.');
+      else for (const ev of buffer) appendMessage(ev, false);
       scrollChat();
     },
     onclosed: (msg) => setServerStatus('subscription closed: ' + msg, true),
@@ -323,31 +352,36 @@ function clearChat(placeholder) {
 
 function appendMessage(ev, scroll) {
   const box = $('messages');
+  const placeholder = box.querySelector('.msg.system');
+  if (placeholder) placeholder.remove();
+
   const div = document.createElement('div');
-  div.className = 'msg';
+  div.className = 'msg' + (ev.pubkey === signer?.pubkey ? ' mine' : '');
   div.dataset.pubkey = ev.pubkey;
 
-  const time = document.createElement('span');
-  time.className = 'time';
-  time.textContent = fmtTime(ev.created_at);
-
+  const head = document.createElement('div');
+  head.className = 'msg-head';
   const author = document.createElement('span');
   author.className = 'author';
   author.textContent = profiles.get(ev.pubkey) || shortNpub(ev.pubkey);
+  const time = document.createElement('span');
+  time.className = 'time';
+  time.textContent = fmtTime(ev.created_at);
+  head.append(author, time);
 
-  const body = document.createElement('span');
+  const body = document.createElement('div');
   body.className = 'body';
-  body.textContent = ev.content; // plain text only — no markup, no media
+  body.textContent = ev.content; // plain text only — never innerHTML
 
-  div.append(time, author, body);
+  div.append(head, body);
   box.appendChild(div);
   if (scroll) scrollChat();
 }
 
-function renderMessagesAuthors() {
+function renderMessageAuthors() {
   for (const div of document.querySelectorAll('#messages .msg[data-pubkey]')) {
     const name = profiles.get(div.dataset.pubkey);
-    if (name) div.querySelector('.author').textContent = name;
+    if (name) setText(div.querySelector('.author'), name);
   }
 }
 
@@ -360,22 +394,22 @@ async function sendMessage() {
   const input = $('composer-input');
   const text = input.value.trim();
   if (!text || !conn || !activeChannel) return;
-  const ev = signEvent(9, [['h', activeChannel]], text);
   input.value = '';
-  const { ok, msg } = await conn.publish(ev);
-  if (!ok) {
-    setServerStatus('send failed: ' + msg, true);
+  input.style.height = 'auto';
+  try {
+    const ev = await signer.sign({ kind: 9, tags: [['h', activeChannel]], content: text });
+    const { ok, msg } = await conn.publish(ev);
+    if (!ok) {
+      setServerStatus('send failed: ' + msg, true);
+      input.value = text;
+    }
+  } catch (e) {
+    setServerStatus('could not sign: ' + (e.message || e), true);
     input.value = text;
   }
 }
 
 // ---------- rendering ----------
-
-function setServerStatus(text, isError) {
-  const el = $('server-status');
-  el.textContent = text;
-  el.style.color = isError ? 'var(--lc-red)' : '';
-}
 
 function renderRail() {
   const list = $('server-list');
@@ -383,17 +417,32 @@ function renderRail() {
   for (const entry of servers) {
     const btn = document.createElement('button');
     btn.className = 'server-icon' + (entry === activeServer ? ' active' : '');
-    btn.textContent = (entry.label || entry.url.replace(/^wss?:\/\//, ''))[0].toUpperCase();
-    btn.title = entry.label ? `${entry.label}\n${entry.url}` : entry.url;
+    const label = entry.label || entry.url.replace(/^wss?:\/\//, '');
+    btn.textContent = label[0].toUpperCase();
+    btn.title = `${label}\n${entry.url}`;
     btn.onclick = () => selectServer(entry);
     btn.oncontextmenu = (e) => {
       e.preventDefault();
-      if (confirm(`Remove server ${entry.label || entry.url}?`)) {
+      const name = prompt('Name this server (Cancel to remove it)', entry.label || '');
+      if (name === null) {
+        if (!confirm(`Remove ${label}?`)) return;
         servers = servers.filter((s) => s !== entry);
         saveServers();
-        if (activeServer === entry) { conn?.destroy(); conn = null; activeServer = null; clearChat(); }
-        renderRail();
+        if (activeServer === entry) {
+          conn?.destroy();
+          conn = null;
+          activeServer = null;
+          channels = new Map();
+          renderChannels();
+          clearChat('Pick a server, or add one with +.');
+          hide($('server-qr-btn'));
+        }
+      } else if (name.trim()) {
+        entry.label = name.trim();
+        saveServers();
+        if (activeServer === entry) setText($('server-name'), entry.label);
       }
+      renderRail();
     };
     list.appendChild(btn);
   }
@@ -402,8 +451,7 @@ function renderRail() {
 function renderChannels() {
   const list = $('channel-list');
   list.innerHTML = '';
-  const sorted = [...channels.values()].sort((a, b) => a.id.localeCompare(b.id));
-  for (const ch of sorted) {
+  for (const ch of [...channels.values()].sort((a, b) => a.id.localeCompare(b.id))) {
     const div = document.createElement('div');
     div.className = 'channel-item' + (ch.id === activeChannel ? ' active' : '');
     div.textContent = '#' + ch.name;
@@ -414,26 +462,34 @@ function renderChannels() {
   $('create-channel-btn').classList.toggle('hidden', !conn);
 }
 
-// ---------- add server ----------
+// ---------- mobile panes ----------
+
+const isMobile = () => window.matchMedia('(max-width: 760px)').matches;
+
+/** 'channels' or 'chat' — only meaningful on phones. */
+function showPane(which) {
+  document.body.classList.toggle('show-chat', which === 'chat');
+}
+
+// ---------- servers ----------
 
 function parseServerInput(raw) {
-  const input = raw.trim();
+  const input = (raw || '').trim();
   if (input.startsWith('obelisk://join') || input.includes('/join?')) {
-    const query = input.split('?')[1] || '';
-    const params = new URLSearchParams(query);
+    const params = new URLSearchParams(input.split('?')[1] || '');
     const relay = params.get('relay');
-    if (!relay) throw new Error('the link has no relay parameter');
+    if (!relay) throw new Error('that link has no relay in it');
     return { url: relay, invite: params.get('invite') || null };
   }
   if (input.startsWith('ws://') || input.startsWith('wss://')) return { url: input, invite: null };
-  throw new Error('paste a ws:// or wss:// relay URL, or an obelisk://join link');
+  throw new Error('paste a ws:// or wss:// URL, or an obelisk://join link');
 }
 
 function addServer(url, invite) {
   let entry = servers.find((s) => s.url === url);
   if (!entry) {
-    const label = url.replace(/^wss?:\/\//, '').split('/')[0].split(':')[0];
-    entry = { url, label: label.length > 20 ? label.slice(0, 12) + '…' : label, invite };
+    const host = url.replace(/^wss?:\/\//, '').split('/')[0].split(':')[0];
+    entry = { url, label: host.length > 18 ? host.slice(0, 10) + '…' : host, invite };
     servers.push(entry);
     saveServers();
   } else if (invite) {
@@ -444,32 +500,90 @@ function addServer(url, invite) {
   selectServer(entry);
 }
 
+async function showQR(title, text) {
+  setText($('qr-title'), title);
+  setText($('qr-text'), text);
+  show($('qr-modal'));
+  try {
+    await renderQR($('share-qr'), text, 240);
+  } catch (e) {
+    setText($('qr-text'), 'Could not render a QR: ' + (e.message || e));
+  }
+  $('qr-copy').onclick = async () => { await copyText(text); flash($('qr-copy')); };
+}
+
+async function openScanner() {
+  hide($('add-server-error'));
+  hide($('scan-error'));
+  show($('scan-modal'));
+  try {
+    stopScanner = await startScanner(
+      $('scan-video'),
+      $('scan-canvas'),
+      (text) => {
+        hide($('scan-modal'));
+        stopScanner = null;
+        try {
+          const { url, invite } = parseServerInput(text);
+          hide($('add-server-modal'));
+          addServer(url, invite);
+        } catch (e) {
+          $('add-server-input').value = text;
+          setText($('add-server-error'), String(e.message || e));
+          show($('add-server-error'));
+        }
+      },
+      (e) => {
+        setText($('scan-error'), String(e.message || e));
+        show($('scan-error'));
+      },
+    );
+  } catch (e) {
+    setText($('scan-error'), String(e.message || e));
+    show($('scan-error'));
+  }
+}
+
+function closeScanner() {
+  stopScanner?.();
+  stopScanner = null;
+  hide($('scan-modal'));
+}
+
 // ---------- hosting (desktop only) ----------
 
 let hostPollTimer = null;
+let lastInvite = null;
 
 async function refreshHostPanel() {
   if (!tauriInvoke) return;
   try {
     const st = await tauriInvoke('host_status');
+    // Tor missing is a blocker, not a footnote: without it the server exists
+    // only on this machine. Say so before the start button, not after.
     $('host-tor-warning').classList.toggle('hidden', st.tor_available);
+    $('host-form').classList.toggle('hidden', !st.tor_available);
+
     if (st.running) {
       hide($('host-stopped'));
       show($('host-running'));
-      $('host-state').textContent = st.tor_state;
-      $('host-local-url').textContent = st.relay_url || '—';
-      $('host-onion').textContent = st.onion ? 'ws://' + st.onion : '(no Tor — local only)';
-      $('host-share').textContent = st.share_link || st.relay_url || '—';
+      setText($('host-state'), st.tor_state);
+      setText($('host-onion'), st.onion ? 'ws://' + st.onion : '(no Tor — local only)');
+      setText($('host-share'), st.share_link || st.relay_url || '—');
       const wl = $('host-wl-list');
       wl.innerHTML = '';
       for (const npub of st.whitelist) {
         const row = document.createElement('div');
         row.className = 'wl-item';
         const code = document.createElement('code');
-        code.textContent = npub;
+        code.textContent = npub.slice(0, 16) + '…' + npub.slice(-6);
+        code.title = npub;
         const del = document.createElement('button');
         del.textContent = 'remove';
-        del.onclick = async () => { await tauriInvoke('host_whitelist_remove', { pubkey: npub }); refreshHostPanel(); };
+        del.onclick = async () => {
+          try { await tauriInvoke('host_whitelist_remove', { pubkey: npub }); refreshHostPanel(); }
+          catch (e) { hostError(e); }
+        };
         row.append(code, del);
         wl.appendChild(row);
       }
@@ -484,20 +598,49 @@ async function refreshHostPanel() {
 
 function hostError(e) {
   const el = $('host-error');
-  el.textContent = String(e?.message || e || '');
+  setText(el, String(e?.message || e || ''));
   el.classList.toggle('hidden', !e);
 }
 
-// ---------- boot ----------
+// ---------- login ----------
+
+function loginError(e) {
+  const el = $('login-error');
+  setText(el, String(e?.message || e || ''));
+  el.classList.toggle('hidden', !e);
+}
+
+function loginBusy(on) {
+  $('login-busy').classList.toggle('hidden', !on);
+}
+
+function showLoginPane(name) {
+  loginError(null);
+  for (const p of ['nsec', 'new', 'bunker']) {
+    $('pane-' + p).classList.toggle('hidden', p !== name);
+  }
+  document.querySelector('.login-methods').classList.toggle('hidden', !!name);
+  if (name !== 'bunker') {
+    ncSession?.cancel();
+    ncSession = null;
+  }
+}
+
+async function adopt(newSigner) {
+  signer = newSigner;
+  persistSigner();
+  enterApp();
+}
 
 function enterApp() {
   hide($('login-screen'));
   show($('app-screen'));
-  $('me-name').textContent = 'me';
-  $('me-npub').textContent = shortNpub(pkHex);
+  setText($('me-name'), myProfile.name || 'set your name');
+  setText($('me-npub'), shortNpub(signer.pubkey));
   renderRail();
   renderChannels();
-  clearChat(servers.length ? 'Pick a server on the left.' : 'Add a server with the + button, or host your own.');
+  showPane('channels');
+  clearChat(servers.length ? 'Pick a server on the left.' : 'Add a server with +, or host your own.');
   if (tauriInvoke) {
     tauriInvoke('host_status')
       .then((st) => { if (st.supported) show($('host-btn')); })
@@ -506,38 +649,97 @@ function enterApp() {
   if (servers.length) selectServer(servers[0]);
 }
 
-function boot() {
-  // login screen
-  $('login-btn').onclick = () => {
+// ---------- boot ----------
+
+function wireLogin() {
+  if (Nip07Signer.available()) show($('m-nip07'));
+
+  $('m-nip07').onclick = async () => {
+    loginError(null);
+    loginBusy(true);
+    try { await adopt(await Nip07Signer.connect()); }
+    catch (e) { loginError(e); }
+    finally { loginBusy(false); }
+  };
+
+  $('m-nsec').onclick = () => showLoginPane('nsec');
+
+  $('m-new').onclick = () => {
+    const s = NsecSigner.generate();
+    $('generated-nsec').textContent = s.nsec();
+    $('generated-nsec').dataset.hex = s.persist().sk;
+    showLoginPane('new');
+  };
+
+  $('m-bunker').onclick = async () => {
+    showLoginPane('bunker');
+    loginBusy(true);
     try {
-      loginWith($('login-nsec').value);
-      enterApp();
+      ncSession = RemoteSigner.startNostrConnect({
+        relays: NOSTR_CONNECT_RELAYS,
+        name: 'Obelisk Menhir',
+        onConnected: (s) => { ncSession = null; adopt(s); },
+        onError: (e) => { loginError(e); loginBusy(false); },
+      });
+      await renderQR($('nc-qr'), ncSession.uri, 220);
+      $('nc-copy').onclick = async () => { await copyText(ncSession.uri); flash($('nc-copy')); };
     } catch (e) {
-      $('login-error').textContent = String(e.message || e);
-      show($('login-error'));
+      loginError(e);
+    } finally {
+      loginBusy(false);
     }
   };
-  $('generate-btn').onclick = () => {
-    const secret = generateSecretKey();
-    $('generated-nsec').textContent = nip19.nsecEncode(secret);
-    $('generated-nsec').dataset.hex = bytesToHex(secret);
-    show($('generated-box'));
+
+  $('bunker-go').onclick = async () => {
+    loginError(null);
+    loginBusy(true);
+    try { await adopt(await RemoteSigner.fromBunkerUri($('bunker-uri').value)); }
+    catch (e) { loginError(e); }
+    finally { loginBusy(false); }
   };
-  $('use-generated-btn').onclick = () => {
-    loginWith($('generated-nsec').dataset.hex);
-    enterApp();
+
+  $('login-nsec-go').onclick = async () => {
+    loginError(null);
+    try { await adopt(NsecSigner.fromInput($('login-nsec').value)); }
+    catch (e) { loginError(e); }
   };
+
+  $('copy-generated').onclick = async () => {
+    await copyText($('generated-nsec').textContent);
+    flash($('copy-generated'));
+  };
+
+  $('use-generated-btn').onclick = async () => {
+    try { await adopt(NsecSigner.fromInput($('generated-nsec').dataset.hex)); }
+    catch (e) { loginError(e); }
+  };
+
+  for (const btn of document.querySelectorAll('[data-back]')) {
+    btn.onclick = () => showLoginPane(null);
+  }
+}
+
+function wireApp() {
   $('logout-btn').onclick = () => {
-    if (!confirm('Log out? Make sure your nsec is backed up — it is removed from this device.')) return;
-    localStorage.removeItem('menhir-sk-hex');
+    if (!confirm('Log out? If you logged in with a secret key, make sure it is backed up — it is removed from this device.')) return;
+    localStorage.removeItem('menhir-signer');
     location.reload();
   };
 
-  // modals
   for (const btn of document.querySelectorAll('[data-close]')) {
-    btn.onclick = () => hide($(btn.dataset.close));
+    btn.onclick = () => {
+      if (btn.dataset.close === 'scan-modal') closeScanner();
+      else hide($(btn.dataset.close));
+      if (btn.dataset.close === 'host-modal') clearInterval(hostPollTimer);
+    };
   }
-  $('add-server-btn').onclick = () => { hide($('add-server-error')); show($('add-server-modal')); $('add-server-input').focus(); };
+
+  // servers
+  $('add-server-btn').onclick = () => {
+    hide($('add-server-error'));
+    show($('add-server-modal'));
+    $('add-server-input').focus();
+  };
   $('add-server-confirm').onclick = () => {
     try {
       const { url, invite } = parseServerInput($('add-server-input').value);
@@ -545,96 +747,159 @@ function boot() {
       $('add-server-input').value = '';
       addServer(url, invite);
     } catch (e) {
-      $('add-server-error').textContent = String(e.message || e);
+      setText($('add-server-error'), String(e.message || e));
       show($('add-server-error'));
     }
   };
+  $('scan-qr-btn').onclick = openScanner;
+  $('server-qr-btn').onclick = () => {
+    if (activeServer) showQR('Share this server', `obelisk://join?relay=${activeServer.url}`);
+  };
 
-  $('create-channel-btn').onclick = () => { hide($('cc-error')); show($('create-channel-modal')); $('cc-id').focus(); };
+  // profile
+  $('me-box').onclick = () => {
+    hide($('profile-error'));
+    $('profile-name').value = myProfile.name || '';
+    $('profile-about').value = myProfile.about || '';
+    setText($('profile-npub'), nip19.npubEncode(signer.pubkey));
+    setText($('profile-signer'), {
+      nsec: 'a secret key on this device',
+      nip07: 'a browser extension',
+      bunker: 'a remote signer (NIP-46)',
+    }[signer.kind] || signer.kind);
+    show($('profile-modal'));
+    $('profile-name').focus();
+  };
+  $('profile-save').onclick = async () => {
+    const name = $('profile-name').value.trim();
+    const about = $('profile-about').value.trim();
+    if (!name) {
+      setText($('profile-error'), 'pick a display name');
+      show($('profile-error'));
+      return;
+    }
+    if (!conn) {
+      setText($('profile-error'), 'connect to a server first — your profile is published to it');
+      show($('profile-error'));
+      return;
+    }
+    try {
+      const content = JSON.stringify(about ? { name, display_name: name, about } : { name, display_name: name });
+      const ev = await signer.sign({ kind: 0, tags: [], content });
+      const { ok, msg } = await conn.publish(ev);
+      if (!ok) throw new Error(msg);
+      myProfile = { name, about };
+      profiles.set(signer.pubkey, name);
+      setText($('me-name'), name);
+      renderMessageAuthors();
+      hide($('profile-modal'));
+    } catch (e) {
+      setText($('profile-error'), String(e.message || e));
+      show($('profile-error'));
+    }
+  };
+
+  // channels
+  $('create-channel-btn').onclick = () => {
+    hide($('cc-error'));
+    show($('create-channel-modal'));
+    $('cc-id').focus();
+  };
   $('cc-confirm').onclick = async () => {
     const id = $('cc-id').value.trim().toLowerCase();
     if (!/^[a-z0-9_-]{1,64}$/.test(id)) {
-      $('cc-error').textContent = 'id must be 1-64 chars of a-z 0-9 - _';
+      setText($('cc-error'), 'id must be 1-64 characters of a-z 0-9 - _');
       show($('cc-error'));
       return;
     }
     const tags = [['h', id]];
     if ($('cc-name').value.trim()) tags.push(['name', $('cc-name').value.trim()]);
     if ($('cc-about').value.trim()) tags.push(['about', $('cc-about').value.trim()]);
-    const { ok, msg } = await conn.publish(signEvent(9007, tags, ''));
-    if (!ok) {
-      $('cc-error').textContent = msg;
+    try {
+      const ev = await signer.sign({ kind: 9007, tags, content: '' });
+      const { ok, msg } = await conn.publish(ev);
+      if (!ok) throw new Error(msg);
+      hide($('create-channel-modal'));
+      $('cc-id').value = $('cc-name').value = $('cc-about').value = '';
+      setTimeout(() => selectChannel(id), 300);
+    } catch (e) {
+      setText($('cc-error'), String(e.message || e));
       show($('cc-error'));
-      return;
     }
-    hide($('create-channel-modal'));
-    $('cc-id').value = $('cc-name').value = $('cc-about').value = '';
-    setTimeout(() => selectChannel(id), 300);
   };
 
   // composer
   $('send-btn').onclick = sendMessage;
-  $('composer-input').addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+  const input = $('composer-input');
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey && !isMobile()) { e.preventDefault(); sendMessage(); }
+  });
+  input.addEventListener('input', () => {
+    input.style.height = 'auto';
+    input.style.height = Math.min(input.scrollHeight, 120) + 'px';
   });
 
-  // phone back button
-  const back = document.createElement('button');
-  back.className = 'back-btn';
-  back.textContent = '‹';
-  back.onclick = () => $('channel-pane').classList.remove('collapsed');
-  $('chat-header').prepend(back);
+  $('back-btn').onclick = () => showPane('channels');
 
   // hosting
-  $('host-btn').onclick = () => { hostError(null); show($('host-modal')); refreshHostPanel(); clearInterval(hostPollTimer); hostPollTimer = setInterval(refreshHostPanel, 3000); };
-  document.querySelector('#host-modal [data-close]').addEventListener('click', () => clearInterval(hostPollTimer));
+  $('host-btn').onclick = () => {
+    hostError(null);
+    show($('host-modal'));
+    refreshHostPanel();
+    clearInterval(hostPollTimer);
+    hostPollTimer = setInterval(refreshHostPanel, 3000);
+  };
+  $('host-recheck-btn').onclick = refreshHostPanel;
   $('host-start-btn').onclick = async () => {
     hostError(null);
-    $('host-start-btn').disabled = true;
-    $('host-start-btn').textContent = 'Starting… (Tor bootstrap can take a minute)';
+    const btn = $('host-start-btn');
+    btn.disabled = true;
+    btn.textContent = 'Starting… Tor can take a minute';
     try {
       await tauriInvoke('host_start', {
         name: $('host-name').value.trim() || 'My Menhir',
-        operatorNpub: nip19.npubEncode(pkHex),
+        operatorNpub: nip19.npubEncode(signer.pubkey),
         useTor: $('host-use-tor').checked,
       });
       await refreshHostPanel();
     } catch (e) {
       hostError(e);
     } finally {
-      $('host-start-btn').disabled = false;
-      $('host-start-btn').textContent = 'Start hosting';
+      btn.disabled = false;
+      btn.textContent = 'Start hosting';
     }
   };
   $('host-stop-btn').onclick = async () => {
     try { await tauriInvoke('host_stop'); await refreshHostPanel(); } catch (e) { hostError(e); }
   };
-  $('host-open-local').onclick = async () => {
-    try {
-      const st = await tauriInvoke('host_status');
-      if (st.relay_url) {
-        clearInterval(hostPollTimer);
-        hide($('host-modal'));
-        addServer(st.relay_url, null);
-      }
-    } catch (e) { hostError(e); }
-  };
   $('host-invite-btn').onclick = async () => {
     try {
       const inv = await tauriInvoke('host_invite_create', { maxUses: 1, expiresHours: null });
-      $('host-invite-out').textContent = inv.share_link || inv.code;
+      lastInvite = inv.share_link || inv.code;
+      setText($('host-invite-out'), lastInvite);
+      show($('host-invite-out'));
+      show($('host-invite-qr'));
     } catch (e) { hostError(e); }
   };
-  $('host-copy-share').onclick = () => {
+  $('host-invite-qr').onclick = () => { if (lastInvite) showQR('Invite — scan to join', lastInvite); };
+  $('host-share-qr').onclick = () => {
     const text = $('host-share').textContent;
-    navigator.clipboard?.writeText(text).catch(() => {
-      const ta = document.createElement('textarea');
-      ta.value = text;
-      document.body.appendChild(ta);
-      ta.select();
-      document.execCommand('copy');
-      ta.remove();
-    });
+    if (text && text !== '—') showQR('Share this server', text);
+  };
+  $('host-copy-share').onclick = async () => {
+    await copyText($('host-share').textContent);
+    flash($('host-copy-share'));
+  };
+  $('host-open-local').onclick = async () => {
+    try {
+      const st = await tauriInvoke('host_status');
+      const url = st.onion ? 'ws://' + st.onion : st.relay_url;
+      if (url) {
+        clearInterval(hostPollTimer);
+        hide($('host-modal'));
+        addServer(url, null);
+      }
+    } catch (e) { hostError(e); }
   };
   $('host-wl-add').onclick = async () => {
     try {
@@ -643,10 +908,24 @@ function boot() {
       refreshHostPanel();
     } catch (e) { hostError(e); }
   };
+}
 
-  // start
-  if (tryRestoreIdentity()) enterApp();
-  else show($('login-screen'));
+async function boot() {
+  wireLogin();
+  wireApp();
+
+  const stored = localStorage.getItem('menhir-signer');
+  if (stored) {
+    try {
+      const restored = await restoreSigner(JSON.parse(stored));
+      if (restored) {
+        signer = restored;
+        enterApp();
+        return;
+      }
+    } catch {}
+  }
+  show($('login-screen'));
 }
 
 boot();

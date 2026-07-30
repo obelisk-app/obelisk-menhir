@@ -33,6 +33,43 @@ Both limits are checked before signature verification and before the
 authentication branches, so refusing costs the relay almost nothing and an
 unauthenticated peer cannot use the path either.
 
+## Rules that exist because they were attacks
+
+Each of these closes a hole found by auditing the relay, and each has a
+regression test in `crates/menhir-relay/tests/relay_integration.rs`.
+
+**Hex must be lowercase.** `id`, `pubkey`, and `sig` are rejected unless they
+are canonical lowercase hex. Hex decoding is case-insensitive, so one key
+otherwise has many spellings that all verify — and since SQLite compares TEXT
+bytewise, a pubkey whitelisted under one spelling is invisible to a revocation
+issued in another. That made banning a silent no-op while the ban *looked*
+applied, because the whitelist listing re-encodes to the same npub.
+
+**One channel per event.** An event may carry at most one `h` tag, and clients
+may not send `d` tags at all. Authorization reads a single `h`, but the tag
+index stores every one — so a second `h` let a message authorized against a
+channel you own be delivered to subscribers of a channel you don't.
+
+**Replays never re-run side effects.** A known event id is refused before any
+membership table is touched. Otherwise re-sending a byte-identical join event
+silently re-added a member an admin had just kicked.
+
+**Deleted channel ids are retired forever.** Creating a channel makes you its
+admin, so a recycled id would hand the name an admin just purged to whoever
+asked next — along with the ability to re-publish the purged events, whose
+signatures are still valid.
+
+**Auth is bound to the endpoint.** The NIP-42 `relay` tag must name the host
+the connection was dialled on (compared against the `Host` header). Without
+it, a relay you visit can forward its own challenge, collect your signed
+reply, and replay it to a third relay to open a session as you.
+
+**Storage is transactional and ties break by id.** Replacement (delete-then-
+insert) runs in one transaction, so a failure cannot leave a profile simply
+gone. On an equal `created_at`, the lowest id wins, per NIP-01, so replicas
+converge. Relay-generated channel metadata is stamped strictly newer than the
+last version instead, since membership can change several times in a second.
+
 ## Channel ids
 
 `h`/`d` values are 1–64 characters of `a-z 0-9 - _`. Chat into a channel that

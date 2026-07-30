@@ -7,7 +7,9 @@
     "build": "esbuild src/main.js --bundle --format=iife --minify --outfile=dist/bundle.js && node -e \"const fs=require('fs');fs.copyFileSync('src/index.html','dist/index.html');fs.copyFileSync('src/styles.css','dist/styles.css')\""
   },
   "dependencies": {
-    "nostr-tools": "^2.10.4"
+    "jsqr": "^1.4.0",
+    "nostr-tools": "^2.10.4",
+    "qrcode": "^1.5.4"
   },
   "devDependencies": {
     "esbuild": "^0.24.2"

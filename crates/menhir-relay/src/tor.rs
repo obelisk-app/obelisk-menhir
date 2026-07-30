@@ -34,14 +34,47 @@ impl TorHandle {
     }
 }
 
-pub fn tor_available() -> bool {
-    std::process::Command::new("tor")
+/// Where Tor is commonly installed, checked when it is not on `PATH`.
+///
+/// This matters most on macOS: an app launched from Finder inherits a minimal
+/// `PATH` (`/usr/bin:/bin:/usr/sbin:/sbin`), so a Homebrew Tor is invisible to
+/// a plain `Command::new("tor")` even though it works fine in the user's
+/// terminal. Without this, hosting silently degrades to local-only.
+const COMMON_TOR_PATHS: &[&str] = &[
+    "/opt/homebrew/bin/tor", // macOS, Apple Silicon Homebrew
+    "/usr/local/bin/tor",    // macOS Intel Homebrew, manual installs
+    "/opt/local/bin/tor",    // MacPorts
+    "/usr/bin/tor",          // Debian/Ubuntu/Arch
+    "/usr/sbin/tor",         // some distro packages
+    "/snap/bin/tor",         // snap
+    "/usr/local/sbin/tor",   // FreeBSD ports
+    "C:\\Program Files\\Tor\\tor.exe",
+    "C:\\Program Files (x86)\\Tor\\tor.exe",
+];
+
+fn runs(cmd: &str) -> bool {
+    std::process::Command::new(cmd)
         .arg("--version")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+/// Resolve the Tor executable: `PATH` first, then the usual install locations.
+pub fn tor_binary() -> Option<String> {
+    if runs("tor") {
+        return Some("tor".to_string());
+    }
+    COMMON_TOR_PATHS
+        .iter()
+        .find(|p| Path::new(p).exists() && runs(p))
+        .map(|p| p.to_string())
+}
+
+pub fn tor_available() -> bool {
+    tor_binary().is_some()
 }
 
 pub fn hidden_service_dir(tor_dir: &Path) -> PathBuf {
@@ -60,12 +93,12 @@ pub fn read_onion_hostname(tor_dir: &Path) -> Option<String> {
 }
 
 pub async fn start(opts: TorOptions) -> Result<TorHandle> {
-    if !tor_available() {
+    let Some(tor_bin) = tor_binary() else {
         bail!(
-            "the `tor` binary was not found on PATH. Install Tor (apt install tor / brew install tor) — \
-             Menhir manages it for you once it is installed"
+            "Tor is not installed. Install it (macOS: brew install tor — Linux: apt install tor) \
+             and start hosting again; Menhir runs and manages it for you."
         );
-    }
+    };
     std::fs::create_dir_all(&opts.tor_dir)?;
     let state_dir = opts.tor_dir.join("state");
     std::fs::create_dir_all(&state_dir)?;
@@ -96,7 +129,7 @@ pub async fn start(opts: TorOptions) -> Result<TorHandle> {
     let torrc_path = opts.tor_dir.join("torrc");
     std::fs::write(&torrc_path, torrc)?;
 
-    let mut child = Command::new("tor")
+    let mut child = Command::new(&tor_bin)
         .arg("-f")
         .arg(&torrc_path)
         .stdout(Stdio::piped())
