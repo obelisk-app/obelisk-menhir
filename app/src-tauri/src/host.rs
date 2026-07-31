@@ -12,7 +12,10 @@ use tokio::sync::Mutex;
 
 use crate::HostStatus;
 
-const SOCKS_PORT: u16 = 39050;
+/// Preferred SOCKS port for the managed Tor. If it is taken — a leftover Tor
+/// from a previous run, Tor Browser, a system Tor — `tor::start` picks another
+/// and reports it back, so nothing here may assume this value is the one in use.
+const PREFERRED_SOCKS_PORT: u16 = 39050;
 
 const TOR_MISSING: &str = "Tor is not installed, so nobody outside this computer could reach your \
                            server. Install it first — macOS: brew install tor — Linux: apt install \
@@ -152,12 +155,16 @@ pub async fn host_start(
 
     if use_tor && tor::tor_available() {
         // One managed Tor per app: restart it with the hidden service attached.
+        // Wait for the old one to actually exit — Tor binds its listeners while
+        // reading the config, so starting the replacement too eagerly makes it
+        // collide with the port the outgoing process still holds and abort
+        // with a bare "Reading config failed".
         if let Some(old) = inner.tor.take() {
             old.stop().await;
         }
         match tor::start(tor::TorOptions {
             tor_dir: tor_dir(&app)?,
-            socks_port: SOCKS_PORT,
+            socks_port: PREFERRED_SOCKS_PORT,
             hidden_service_target: Some(inner.relay_port),
             bootstrap_timeout_secs: 180,
         })
@@ -191,7 +198,7 @@ pub async fn host_stop(app: AppHandle, state: State<'_, NodeState>) -> Result<Ho
     if !inner.bridges.is_empty() && tor::tor_available() {
         if let Ok(th) = tor::start(tor::TorOptions {
             tor_dir: tor_dir(&app)?,
-            socks_port: SOCKS_PORT,
+            socks_port: PREFERRED_SOCKS_PORT,
             hidden_service_target: None,
             bootstrap_timeout_secs: 180,
         })
@@ -319,7 +326,7 @@ pub async fn bridge_open(
     if inner.tor.is_none() {
         let th = tor::start(tor::TorOptions {
             tor_dir: tor_dir(&app)?,
-            socks_port: SOCKS_PORT,
+            socks_port: PREFERRED_SOCKS_PORT,
             hidden_service_target: None,
             bootstrap_timeout_secs: 180,
         })
@@ -327,6 +334,12 @@ pub async fn bridge_open(
         .map_err(|e| e.to_string())?;
         inner.tor = Some(th);
     }
+    // Whatever port Tor actually bound, not the one we asked for.
+    let socks_port = inner
+        .tor
+        .as_ref()
+        .map(|t| t.socks_port)
+        .ok_or("Tor is not running")?;
 
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
@@ -339,7 +352,7 @@ pub async fn bridge_open(
             let target_host = target_host.clone();
             tokio::spawn(async move {
                 match tokio_socks::tcp::Socks5Stream::connect(
-                    format!("127.0.0.1:{SOCKS_PORT}").as_str(),
+                    format!("127.0.0.1:{socks_port}").as_str(),
                     (target_host.as_str(), port),
                 )
                 .await
