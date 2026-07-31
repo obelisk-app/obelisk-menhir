@@ -35,9 +35,11 @@ what separates this proof of concept from the "definition of done" there.
 
 ## Protocol / product
 
-- **No media, formatting, DMs, reactions, threads, or voice.** The relay
-  rejects those kinds outright. Message bodies render as plain text
-  (`textContent`, never `innerHTML`).
+- **No media, formatting, DMs, reactions, or voice.** The relay rejects those
+  kinds outright. Message bodies render as plain text (`textContent`, never
+  `innerHTML`) — emoji are just characters in that text. Replies exist (a
+  NIP-10 marked `e` tag), but not threads: a reply is shown next to what it
+  answers, not in a room of its own.
 - **Channels inside a relay are open to any whitelisted member.** NIP-29
   private groups with per-group membership gating are not enforced — the
   whitelist is the boundary. Moderation kinds do check channel admin.
@@ -45,7 +47,9 @@ what separates this proof of concept from the "definition of done" there.
   channel (kind 9008) purges its events; that is the only removal path.
 - **`created_at` ordering is trusted.** A whitelisted client can backdate
   messages within the ±15 min future clamp and reorder its own history.
-- **No read state, unread badges, or notifications.**
+- **Publication channels gate posting, not reading.** Anyone the server
+  admits can read every channel; the type only decides who may start a post.
+  Per-channel read access needs membership gating the relay does not have.
 
 ## Client behaviour
 
@@ -88,6 +92,9 @@ what separates this proof of concept from the "definition of done" there.
   both). `menhir-relay serve` logs to stdout; set `RUST_LOG=debug` for detail.
 - **No automatic restart with backoff** if the embedded relay dies — the spec
   calls for a bounded-backoff supervisor in the node manager. Today a crashed
-  relay stays down until the user toggles hosting off and on.
+  relay stays down until the user toggles hosting off and on. (A server that
+  was hosting *does* come back when the app is next opened: `autostart` in
+  the relay config, cleared by "Stop hosting". That covers the restart, not
+  the crash.)
 - **No backup command.** Copy the whole app-data directory (it holds
   `relay.sqlite`, `relay-secret.hex`, `config.json`, and `tor/hs/`).

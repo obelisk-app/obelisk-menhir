@@ -1,7 +1,7 @@
 //! Desktop node manager: embedded menhir-relay + managed Tor + onion bridges.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use menhir_core::keys::{nip19_encode, pubkey_to_hex};
 use menhir_relay::config::{load_config, save_config};
@@ -41,6 +41,31 @@ pub struct NodeState(Mutex<NodeInner>);
 
 pub fn setup(app: &tauri::App) {
     app.manage(NodeState::default());
+
+    // Bring a server that was running last time back up, without waiting for
+    // anyone to press anything. Hosting is a promise to other people — a
+    // relay that silently stays down after an app restart is an address in
+    // everyone's invite links that answers nothing.
+    let handle = app.handle().clone();
+    tauri::async_runtime::spawn(async move {
+        if let Err(e) = resume_hosting(&handle).await {
+            eprintln!("could not resume hosting: {e}");
+        }
+    });
+}
+
+async fn resume_hosting(app: &AppHandle) -> Result<(), String> {
+    let dir = host_dir(app)?;
+    let cfg = load_config(&dir).map_err(|e| e.to_string())?;
+    let (true, Some(operator)) = (cfg.autostart, cfg.operator_pubkey.clone()) else {
+        return Ok(());
+    };
+    let state = app.state::<NodeState>();
+    let mut inner = state.0.lock().await;
+    if inner.relay.is_some() {
+        return Ok(());
+    }
+    start_node(app, &mut inner, cfg, operator).await
 }
 
 fn host_dir(app: &AppHandle) -> Result<PathBuf, String> {
@@ -53,31 +78,48 @@ fn tor_dir(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(base.join("tor"))
 }
 
-fn whitelist_npubs(dir: &PathBuf) -> Vec<String> {
-    Db::open(&dir.join("relay.sqlite"))
-        .and_then(|db| db.whitelist_list())
-        .map(|pks| pks.iter().map(|pk| nip19_encode("npub", pk)).collect())
-        .unwrap_or_default()
+/// An empty list is what the panel shows when the database cannot be read, so
+/// say why on the way past — otherwise a locked or missing file looks exactly
+/// like a server nobody has been invited to.
+fn or_empty<T>(what: &str, result: anyhow::Result<Vec<T>>) -> Vec<T> {
+    match result {
+        Ok(rows) => rows,
+        Err(e) => {
+            eprintln!("could not read {what}: {e}");
+            Vec::new()
+        }
+    }
 }
 
-fn invite_rows(dir: &PathBuf) -> Vec<crate::InviteRow> {
-    Db::open(&dir.join("relay.sqlite"))
-        .and_then(|db| db.invite_list())
-        .map(|invites| {
-            invites
-                .into_iter()
-                .map(|i| crate::InviteRow {
-                    code: i.code,
-                    uses: i.uses,
-                    max_uses: i.max_uses,
-                    expires_at: i.expires_at,
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+fn whitelist_npubs(dir: &Path) -> Vec<String> {
+    or_empty(
+        "the whitelist",
+        Db::open(&dir.join("relay.sqlite"))
+            .and_then(|db| db.whitelist_list())
+            .map(|pks| pks.iter().map(|pk| nip19_encode("npub", pk)).collect()),
+    )
 }
 
-fn status_of(inner: &NodeInner, dir: &PathBuf) -> HostStatus {
+fn invite_rows(dir: &Path) -> Vec<crate::InviteRow> {
+    or_empty(
+        "the invite list",
+        Db::open(&dir.join("relay.sqlite"))
+            .and_then(|db| db.invite_list())
+            .map(|invites| {
+                invites
+                    .into_iter()
+                    .map(|i| crate::InviteRow {
+                        code: i.code,
+                        uses: i.uses,
+                        max_uses: i.max_uses,
+                        expires_at: i.expires_at,
+                    })
+                    .collect()
+            }),
+    )
+}
+
+fn status_of(inner: &NodeInner, dir: &Path) -> HostStatus {
     let tor_available = tor::tor_available();
     let running = inner.relay.is_some();
     let relay_url = running.then(|| format!("ws://127.0.0.1:{}", inner.relay_port));
@@ -89,6 +131,7 @@ fn status_of(inner: &NodeInner, dir: &PathBuf) -> HostStatus {
     HostStatus {
         supported: true,
         running,
+        starting: false,
         name: inner.name.clone(),
         relay_url,
         onion: inner.onion.clone(),
@@ -116,8 +159,78 @@ fn status_of(inner: &NodeInner, dir: &PathBuf) -> HostStatus {
 
 #[tauri::command]
 pub async fn host_status(app: AppHandle, state: State<'_, NodeState>) -> Result<HostStatus, String> {
-    let inner = state.0.lock().await;
-    Ok(status_of(&inner, &host_dir(&app)?))
+    let dir = host_dir(&app)?;
+    // Starting holds this lock for as long as Tor takes to bootstrap — up to
+    // three minutes on a cold circuit. Waiting for it here would freeze the
+    // panel that is asking; saying "starting" is both true and useful.
+    match state.0.try_lock() {
+        Ok(inner) => Ok(status_of(&inner, &dir)),
+        Err(_) => Ok(HostStatus {
+            supported: true,
+            starting: true,
+            tor_state: "starting…".into(),
+            ..Default::default()
+        }),
+    }
+}
+
+/// Start the relay and, when asked for, the Tor hidden service in front of it.
+///
+/// Shared by the explicit "Start hosting" button and the resume-on-launch
+/// path, so a server that comes back by itself comes back configured exactly
+/// as the operator left it.
+async fn start_node(
+    app: &AppHandle,
+    inner: &mut NodeInner,
+    cfg: menhir_relay::config::RelayConfig,
+    operator: String,
+) -> Result<(), String> {
+    let dir = host_dir(app)?;
+    let mut cfg = cfg;
+    cfg.operator_pubkey = Some(operator);
+
+    // The configured port may be taken by another process — fall back to ephemeral.
+    let (handle, relay_state) = match server::start(&dir, cfg.clone()).await {
+        Ok(r) => r,
+        Err(_) => {
+            let mut retry = cfg.clone();
+            retry.port = 0;
+            server::start(&dir, retry).await.map_err(|e| e.to_string())?
+        }
+    };
+    inner.relay_port = handle.port;
+    inner.bind_all = cfg.bind_all;
+    inner.relay = Some(handle);
+    inner.relay_state = Some(relay_state);
+    inner.name = cfg.name.clone();
+
+    if cfg.use_tor && tor::tor_available() {
+        // One managed Tor per app: restart it with the hidden service attached.
+        // Wait for the old one to actually exit — Tor binds its listeners while
+        // reading the config, so starting the replacement too eagerly makes it
+        // collide with the port the outgoing process still holds and abort
+        // with a bare "Reading config failed".
+        if let Some(old) = inner.tor.take() {
+            old.stop().await;
+        }
+        match tor::start(tor::TorOptions {
+            tor_dir: tor_dir(app)?,
+            socks_port: PREFERRED_SOCKS_PORT,
+            hidden_service_target: Some(inner.relay_port),
+            bootstrap_timeout_secs: 180,
+        })
+        .await
+        {
+            Ok(th) => {
+                inner.onion = th.onion.clone();
+                inner.tor = Some(th);
+            }
+            // The relay stays up local-only; surface the Tor failure so the
+            // user knows the server is not reachable from outside.
+            Err(e) => return Err(format!("relay started locally, but Tor failed: {e}")),
+        }
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -149,51 +262,16 @@ pub async fn host_start(
     let operator = pubkey_to_hex(&operator_npub).map_err(|e| e.to_string())?;
     let mut cfg = load_config(&dir).map_err(|e| e.to_string())?;
     cfg.name = if name.trim().is_empty() { "My Menhir".into() } else { name.trim().to_string() };
-    cfg.operator_pubkey = Some(operator);
+    cfg.operator_pubkey = Some(operator.clone());
     cfg.bind_all = clearnet;
+    cfg.use_tor = use_tor;
+    // Written before the start, not after: a Tor bootstrap that fails halfway
+    // still leaves a relay running, and that is a server the app should bring
+    // back next time.
+    cfg.autostart = true;
     save_config(&dir, &cfg).map_err(|e| e.to_string())?;
 
-    // The configured port may be taken by another process — fall back to ephemeral.
-    let (handle, relay_state) = match server::start(&dir, cfg.clone()).await {
-        Ok(r) => r,
-        Err(_) => {
-            let mut retry = cfg.clone();
-            retry.port = 0;
-            server::start(&dir, retry).await.map_err(|e| e.to_string())?
-        }
-    };
-    inner.relay_port = handle.port;
-    inner.bind_all = cfg.bind_all;
-    inner.relay = Some(handle);
-    inner.relay_state = Some(relay_state);
-    inner.name = cfg.name.clone();
-
-    if use_tor && tor::tor_available() {
-        // One managed Tor per app: restart it with the hidden service attached.
-        // Wait for the old one to actually exit — Tor binds its listeners while
-        // reading the config, so starting the replacement too eagerly makes it
-        // collide with the port the outgoing process still holds and abort
-        // with a bare "Reading config failed".
-        if let Some(old) = inner.tor.take() {
-            old.stop().await;
-        }
-        match tor::start(tor::TorOptions {
-            tor_dir: tor_dir(&app)?,
-            socks_port: PREFERRED_SOCKS_PORT,
-            hidden_service_target: Some(inner.relay_port),
-            bootstrap_timeout_secs: 180,
-        })
-        .await
-        {
-            Ok(th) => {
-                inner.onion = th.onion.clone();
-                inner.tor = Some(th);
-            }
-            // The relay stays up local-only; surface the Tor failure so the
-            // user knows the server is not reachable from outside.
-            Err(e) => return Err(format!("relay started locally, but Tor failed: {e}")),
-        }
-    }
+    start_node(&app, &mut inner, cfg, operator).await?;
     Ok(status_of(&inner, &dir))
 }
 
@@ -201,6 +279,11 @@ pub async fn host_start(
 pub async fn host_stop(app: AppHandle, state: State<'_, NodeState>) -> Result<HostStatus, String> {
     let dir = host_dir(&app)?;
     let mut inner = state.0.lock().await;
+    // Stopping is a decision, not a crash: it must survive a restart too.
+    if let Ok(mut cfg) = load_config(&dir) {
+        cfg.autostart = false;
+        let _ = save_config(&dir, &cfg);
+    }
     if let Some(relay) = inner.relay.take() {
         relay.stop().await;
     }

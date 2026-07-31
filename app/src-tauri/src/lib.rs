@@ -57,6 +57,8 @@ pub struct HostStatus {
     /// False on Android/iOS — hosting is a desktop feature.
     pub supported: bool,
     pub running: bool,
+    /// True while a start is in flight — the relay is neither up nor idle.
+    pub starting: bool,
     pub name: String,
     pub relay_url: Option<String>,
     pub onion: Option<String>,

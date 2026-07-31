@@ -114,8 +114,16 @@ check('every app control is wired', () => {
     'logout-btn-settings', 'create-channel-btn', 'cc-confirm', 'send-btn',
     'channel-admin-btn', 'ca-save', 'ca-delete',
     'back-btn', 'logout-btn', 'host-recheck-btn', 'host-start-btn', 'host-stop-btn',
-    'host-invite-btn', 'host-invite-qr', 'host-share-qr', 'host-copy-share',
-    'host-open-local', 'host-wl-add', 'host-revoke-all', 'qr-copy'];
+    'host-invite-btn', 'host-invite-qr', 'host-invite-copy', 'host-share-qr', 'host-copy-share',
+    'host-open-local', 'host-wl-add', 'host-revoke-all', 'qr-copy',
+    'emoji-btn', 'reply-cancel', 'host-btn'];
+  // Elements the app writes into but never wires a click to.
+  const written = ['chat-about', 'composer-note', 'reply-strip', 'reply-strip-who',
+    'reply-strip-text', 'host-starting', 'host-start-note', 'host-invite-uses',
+    'host-invite-expiry', 'confirm-title', 'confirm-body', 'confirm-go', 'confirm-cancel',
+    'toast-stack', 'cc-type', 'ca-type'];
+  const absent = written.filter((id) => !$(id));
+  if (absent.length) throw new Error('missing elements: ' + absent.join(', '));
   const missing = ids.filter((id) => !$(id));
   if (missing.length) throw new Error('missing elements: ' + missing.join(', '));
   const unwired = ids.filter((id) => typeof $(id).onclick !== 'function');
@@ -172,6 +180,96 @@ check('garbage input is rejected with a message', () => {
   $('add-server-confirm').onclick();
   if ($('add-server-error').classList.contains('hidden')) throw new Error('no error shown');
 });
+check('a clearnet host without a scheme is dialled over TLS', () => {
+  $('add-server-input').value = 'relay.example.org:7777';
+  $('add-server-confirm').onclick();
+  const saved = JSON.parse(window.localStorage.getItem('menhir-servers') || '[]');
+  if (!saved.some((s) => s.url === 'wss://relay.example.org:7777')) {
+    throw new Error('expected wss://, got ' + JSON.stringify(saved.map((s) => s.url)));
+  }
+});
+check('a LAN address without a scheme stays plain ws://', () => {
+  $('add-server-input').value = '192.168.1.20:4869';
+  $('add-server-confirm').onclick();
+  const saved = JSON.parse(window.localStorage.getItem('menhir-servers') || '[]');
+  if (!saved.some((s) => s.url === 'ws://192.168.1.20:4869')) {
+    throw new Error('expected ws://, got ' + JSON.stringify(saved.map((s) => s.url)));
+  }
+});
+check('an https:// URL is understood as a relay', () => {
+  $('add-server-input').value = 'https://relay.example.net';
+  $('add-server-confirm').onclick();
+  const saved = JSON.parse(window.localStorage.getItem('menhir-servers') || '[]');
+  if (!saved.some((s) => s.url === 'wss://relay.example.net')) throw new Error('https not converted');
+});
+
+console.log('\nmenus:');
+check('settings shows one section at a time', () => {
+  $('me-box').onclick();
+  const panel = (name) => window.document.querySelector(`.settings-panel[data-panel="${name}"]`);
+  if (panel('profile').classList.contains('hidden')) throw new Error('profile section not shown');
+  if (!panel('identity').classList.contains('hidden')) throw new Error('every section shown at once');
+  window.document.querySelector('.settings-tab[data-tab="identity"]').onclick();
+  if (panel('identity').classList.contains('hidden')) throw new Error('identity did not open');
+  if (!panel('profile').classList.contains('hidden')) throw new Error('profile did not close');
+  window.document.querySelector('[data-close="profile-modal"]').onclick();
+});
+check('Escape closes the panel on top', () => {
+  $('add-server-btn').onclick();
+  if ($('add-server-modal').classList.contains('hidden')) throw new Error('panel did not open');
+  window.document.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+  if (!$('add-server-modal').classList.contains('hidden')) throw new Error('Escape did not close it');
+});
+check('a destructive action asks in-app, and Cancel means cancel', () => {
+  const before = JSON.parse(window.localStorage.getItem('menhir-servers') || '[]').length;
+  $('server-settings-btn').onclick();
+  $('server-remove').onclick();
+  if ($('confirm-modal').classList.contains('hidden')) throw new Error('no confirmation shown');
+  $('confirm-cancel').onclick();
+  const after = JSON.parse(window.localStorage.getItem('menhir-servers') || '[]').length;
+  if (after !== before) throw new Error('cancelling still removed the server');
+});
+check('confirming removes the server and says so', async () => {
+  const before = JSON.parse(window.localStorage.getItem('menhir-servers') || '[]').length;
+  $('server-settings-btn').onclick();
+  $('server-remove').onclick();
+  $('confirm-go').onclick();
+  await new Promise((r) => setTimeout(r, 20));
+  const after = JSON.parse(window.localStorage.getItem('menhir-servers') || '[]').length;
+  if (after !== before - 1) throw new Error(`server not removed (${before} → ${after})`);
+  if (!$('toast-stack').textContent.includes('removed')) throw new Error('no toast shown');
+});
+
+console.log('\ncomposing:');
+check('the emoji picker inserts at the caret', () => {
+  const input = $('composer-input');
+  input.value = 'hi ';
+  input.setSelectionRange(3, 3);
+  $('emoji-btn').onclick(new window.MouseEvent('click'));
+  const picker = window.document.querySelector('.emoji-picker');
+  if (!picker || picker.classList.contains('hidden')) throw new Error('picker did not open');
+  const cell = picker.querySelector('.emoji-cell');
+  if (!cell) throw new Error('no emoji to pick');
+  cell.onclick();
+  if (input.value === 'hi ') throw new Error('nothing inserted');
+  if (!input.value.startsWith('hi ')) throw new Error('inserted in the wrong place: ' + input.value);
+});
+check('emoji search finds something for "fire"', () => {
+  const picker = window.document.querySelector('.emoji-picker');
+  const search = picker.querySelector('.emoji-search');
+  search.value = 'fire';
+  search.dispatchEvent(new window.Event('input'));
+  const hits = picker.querySelectorAll('.emoji-cell');
+  if (!hits.length) throw new Error('no results for "fire"');
+  if (![...hits].some((c) => c.textContent === '🔥')) throw new Error('🔥 not among the results');
+});
+check('replying without a connection does not lose the text', async () => {
+  const input = $('composer-input');
+  input.value = 'a message that cannot be sent';
+  $('send-btn').onclick();
+  await new Promise((r) => setTimeout(r, 20));
+  if (input.value !== 'a message that cannot be sent') throw new Error('the message was dropped');
+});
 
 console.log('\nunread:');
 check('unread counts skip your own messages and anything already read', async () => {
@@ -205,6 +303,35 @@ check('resume point sits behind the newest message', async () => {
   if (store.resumeSince([]) !== undefined) throw new Error('empty cache must fetch history');
   const since = store.resumeSince([{ created_at: 1000 }]);
   if (!(since < 1000)) throw new Error('resume must overlap, got ' + since);
+});
+check('flushing writes out the debounce instead of dropping it', async () => {
+  // store.js reaches for the global localStorage; lend it the DOM's.
+  globalThis.localStorage = window.localStorage;
+  const store = await import('./src/store.js');
+  const url = 'ws://flush.test';
+  store.saveMessages(url, 'general', [{ id: 'x', created_at: 5, pubkey: 'aa', content: 'hi' }]);
+  store.flushWrites();
+  const back = store.loadMessages(url, 'general');
+  if (back.length !== 1) throw new Error(`expected the message to survive, got ${back.length}`);
+  store.forgetServer(url);
+});
+check('a self-hosted relay keeps its history when its port moves', async () => {
+  globalThis.localStorage = window.localStorage;
+  const store = await import('./src/store.js');
+  store.saveChannels('ws://127.0.0.1:4869', [{ id: 'general', name: 'General' }]);
+  store.saveMessages('ws://127.0.0.1:4869', 'general', [{ id: 'y', created_at: 9, pubkey: 'bb', content: 'yo' }]);
+  store.flushWrites();
+  store.renameServer('ws://127.0.0.1:4869', 'ws://127.0.0.1:5555');
+  if (store.loadMessages('ws://127.0.0.1:5555', 'general').length !== 1) {
+    throw new Error('messages did not follow the port');
+  }
+  if (store.loadChannels('ws://127.0.0.1:5555').length !== 1) {
+    throw new Error('channels did not follow the port');
+  }
+  if (store.loadMessages('ws://127.0.0.1:4869', 'general').length !== 0) {
+    throw new Error('the old key was left behind');
+  }
+  store.forgetServer('ws://127.0.0.1:5555');
 });
 
 console.log('\nqr:');

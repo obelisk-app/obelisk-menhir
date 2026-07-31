@@ -33,6 +33,18 @@ pub struct RelayConfig {
     /// to it, so the whitelist becomes the only thing standing there.
     #[serde(default)]
     pub bind_all: bool,
+    /// Start this server again when the app next opens.
+    ///
+    /// Set when hosting is started from the desktop app and cleared when it is
+    /// stopped, so "keep the app running to keep your server online" holds
+    /// across a restart of the app — otherwise everyone's invite links point
+    /// at a relay that quietly never came back.
+    #[serde(default)]
+    pub autostart: bool,
+    /// Whether the last start published an onion service, so a resumed server
+    /// comes back at the same address it was shared under.
+    #[serde(default)]
+    pub use_tor: bool,
 }
 
 impl Default for RelayConfig {
@@ -46,6 +58,8 @@ impl Default for RelayConfig {
             max_content_len: 4096,
             locked: false,
             bind_all: false,
+            autostart: false,
+            use_tor: false,
         }
     }
 }

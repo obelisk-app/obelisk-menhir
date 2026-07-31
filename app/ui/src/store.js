@@ -52,6 +52,7 @@ function pruneOldest() {
 
 // ---------- messages ----------
 
+/** key -> { timer, messages } for writes waiting out the debounce. */
 const pendingWrites = new Map();
 
 export function loadMessages(serverUrl, channelId) {
@@ -66,21 +67,71 @@ export function loadMessages(serverUrl, channelId) {
  */
 export function saveMessages(serverUrl, channelId, messages) {
   const key = `msgs/${serverKey(serverUrl)}/${channelId}`;
-  clearTimeout(pendingWrites.get(key));
-  pendingWrites.set(
-    key,
-    setTimeout(() => {
-      pendingWrites.delete(key);
-      // Keep the newest slice: old history is re-fetchable, recent context isn't.
-      write(key, messages.slice(-MAX_MESSAGES));
-    }, WRITE_DEBOUNCE_MS),
-  );
+  clearTimeout(pendingWrites.get(key)?.timer);
+  // Keep the newest slice: old history is re-fetchable, recent context isn't.
+  const payload = messages.slice(-MAX_MESSAGES);
+  const timer = setTimeout(() => {
+    pendingWrites.delete(key);
+    write(key, payload);
+  }, WRITE_DEBOUNCE_MS);
+  pendingWrites.set(key, { timer, payload });
 }
 
-/** Flush any debounced writes immediately (on hide/unload). */
+/**
+ * Write out anything still inside the debounce window, now.
+ *
+ * Called when the app is hidden — a mobile webview can be killed without
+ * another chance to run, and cancelling the timers (as this once did) threw
+ * away exactly the messages that had just arrived.
+ */
 export function flushWrites() {
-  for (const [, timer] of pendingWrites) clearTimeout(timer);
+  for (const [key, { timer, payload }] of pendingWrites) {
+    clearTimeout(timer);
+    write(key, payload);
+  }
   pendingWrites.clear();
+}
+
+/**
+ * Move a server's cache to a new URL.
+ *
+ * A relay you host yourself comes back on a different loopback port when its
+ * usual one is taken, and the URL is the cache key — without this, every
+ * restart that shifted the port looked like a server with no history.
+ */
+export function renameServer(oldUrl, newUrl) {
+  const from = serverKey(oldUrl);
+  const to = serverKey(newUrl);
+  if (from === to) return;
+  const moves = [];
+  for (let i = 0; i < localStorage.length; i++) {
+    const k = localStorage.key(i);
+    if (!k?.startsWith(PREFIX)) continue;
+    const rest = k.slice(PREFIX.length);
+    // `msgs/<server>/<channel>` and `chans|profiles|read/<server>`.
+    const parts = rest.split('/');
+    if (parts[1] === from) {
+      parts[1] = to;
+      moves.push([k, PREFIX + parts.join('/')]);
+    }
+  }
+  for (const [oldKey, newKey] of moves) {
+    const value = localStorage.getItem(oldKey);
+    if (value !== null) {
+      try { localStorage.setItem(newKey, value); } catch {}
+    }
+    localStorage.removeItem(oldKey);
+  }
+}
+
+/** Unread count for a server that is not connected, straight from the cache. */
+export function cachedUnreadForServer(serverUrl, myPubkey) {
+  const readState = loadReadState(serverUrl);
+  let n = 0;
+  for (const ch of loadChannels(serverUrl)) {
+    n += unreadIn(loadMessages(serverUrl, ch.id), readState[ch.id] || 0, myPubkey);
+  }
+  return n;
 }
 
 /**

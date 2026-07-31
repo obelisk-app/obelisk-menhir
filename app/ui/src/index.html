@@ -10,7 +10,12 @@
   <!-- ============ Login ============ -->
   <div id="login-screen" class="screen hidden">
     <div class="login-card lc-card">
-      <div class="login-logo"></div>
+      <div class="login-logo">
+        <svg viewBox="0 0 512 512" fill="currentColor" aria-hidden="true" class="obelisk-mark">
+          <path d="M 256,16 L 220,72 L 196,460 L 200,464 L 256,464 L 256,72 Z" opacity="0.7" />
+          <path d="M 256,16 L 292,72 L 316,460 L 312,464 L 256,464 L 256,72 Z" />
+        </svg>
+      </div>
       <h1>Obelisk Menhir</h1>
       <p class="muted">Sovereign text channels over Nostr. Your key is your identity — no email, no password.</p>
 
@@ -99,13 +104,25 @@
     <main id="chat-pane">
       <div id="chat-header">
         <button id="back-btn" class="icon-btn">‹</button>
-        <span id="chat-title" class="grow">Pick a channel</span>
+        <div class="grow chat-heading">
+          <span id="chat-title">Pick a channel</span>
+          <span id="chat-about" class="muted small"></span>
+        </div>
         <button id="channel-admin-btn" class="icon-btn hidden" title="Channel settings (admin)">⚙</button>
       </div>
       <div id="messages"></div>
       <div id="composer" class="hidden">
-        <textarea id="composer-input" rows="1" placeholder="Message… (plain text)"></textarea>
-        <button id="send-btn" class="pill primary">Send</button>
+        <div id="reply-strip" class="hidden">
+          <span class="reply-strip-label">Replying to <b id="reply-strip-who"></b></span>
+          <span id="reply-strip-text" class="reply-strip-text"></span>
+          <button id="reply-cancel" class="icon-btn" title="Cancel reply">✕</button>
+        </div>
+        <p id="composer-note" class="composer-note hidden"></p>
+        <div class="composer-row">
+          <button id="emoji-btn" class="icon-btn" title="Emoji">☺</button>
+          <textarea id="composer-input" rows="1" placeholder="Message… (plain text)"></textarea>
+          <button id="send-btn" class="pill primary">Send</button>
+        </div>
       </div>
     </main>
   </div>
@@ -114,10 +131,11 @@
   <div id="add-server-modal" class="modal hidden">
     <div class="modal-card lc-card">
       <h2>Add a server</h2>
-      <p class="muted small">Scan an invite QR, or paste a relay URL / obelisk://join link.</p>
+      <p class="muted small">Scan an invite QR, or paste an address. Anything works: a Tor onion, a machine on your network, or a relay on the open internet.</p>
       <button id="scan-qr-btn" class="pill primary wide-btn">▦ Scan a QR code</button>
       <p class="small muted or-line">or paste it</p>
-      <input id="add-server-input" placeholder="obelisk://join?relay=ws://…onion&invite=CODE" />
+      <input id="add-server-input" placeholder="wss://relay.example.com, 192.168.1.20:4869, or an obelisk://join link" />
+      <p class="small muted hint">Bare addresses become <code class="inline">wss://</code>, except a plain IP or <code class="inline">.local</code> name, which is assumed to be a server on your own network.</p>
       <input id="add-server-name" placeholder="Name it (optional — the server can tell us its own)" maxlength="40" />
       <p id="add-server-error" class="error hidden"></p>
       <div class="row gap right">
@@ -150,7 +168,7 @@
       <p id="qr-note" class="warn hidden"></p>
       <div class="row gap right">
         <button id="qr-copy" class="pill">Copy link</button>
-        <button class="pill" data-close="qr-modal">Close</button>
+        <button class="pill primary" data-close="qr-modal">Close</button>
       </div>
     </div>
   </div>
@@ -170,44 +188,70 @@
     </div>
   </div>
 
+  <!-- Settings: a fixed-height panel with its own nav, so the desktop shows
+       one section at a time instead of one long scroll. -->
   <div id="profile-modal" class="modal hidden">
-    <div class="modal-card lc-card wide">
-      <h2>Settings</h2>
+    <div class="modal-card lc-card settings-card">
+      <nav class="settings-nav">
+        <div class="settings-nav-title">Settings</div>
+        <button class="settings-tab active" data-tab="profile">Profile</button>
+        <button class="settings-tab" data-tab="identity">Identity</button>
+        <button class="settings-tab" data-tab="storage">Storage</button>
+        <button class="settings-tab" data-tab="about">About</button>
+        <div class="settings-nav-spacer"></div>
+        <button id="logout-btn-settings" class="pill danger-inline settings-logout">Log out</button>
+      </nav>
 
-      <h3>Profile</h3>
-      <p class="muted small">The name other people see in channels. Published to the server you are connected to.</p>
-      <input id="profile-name" placeholder="Display name" maxlength="64" />
-      <input id="profile-about" placeholder="About you (optional)" maxlength="200" />
-      <div class="row gap">
-        <button id="profile-save" class="pill primary">Save profile</button>
-        <span id="profile-saved" class="muted small hidden">saved</span>
+      <div class="settings-body">
+        <section class="settings-panel" data-panel="profile">
+          <h2>Profile</h2>
+          <p class="muted small">The name other people see in channels. Published to the server you are connected to.</p>
+          <label class="field"><span>Display name</span>
+            <input id="profile-name" placeholder="Display name" maxlength="64" />
+          </label>
+          <label class="field"><span>About you</span>
+            <input id="profile-about" placeholder="Optional" maxlength="200" />
+          </label>
+          <div class="row gap">
+            <button id="profile-save" class="pill primary">Save profile</button>
+            <span id="profile-saved" class="muted small hidden">saved</span>
+          </div>
+          <p id="profile-error" class="error hidden"></p>
+        </section>
+
+        <section class="settings-panel hidden" data-panel="identity">
+          <h2>Identity</h2>
+          <p class="muted small">Your key is your account. There is nothing else to log in with.</p>
+          <div class="kv"><span>Your npub</span><code id="profile-npub" class="block-code"></code></div>
+          <div class="kv"><span>Signing with</span><b id="profile-signer">—</b></div>
+          <div class="row gap">
+            <button id="copy-npub" class="pill small-btn">Copy npub</button>
+            <button id="reveal-nsec" class="pill small-btn hidden">Show secret key</button>
+          </div>
+          <div id="nsec-box" class="hidden">
+            <p class="warn">Anyone holding this key is you. Never paste it anywhere you do not trust.</p>
+            <code id="nsec-value" class="block-code"></code>
+            <button id="copy-nsec" class="pill small-btn">Copy secret key</button>
+          </div>
+        </section>
+
+        <section class="settings-panel hidden" data-panel="storage">
+          <h2>Storage</h2>
+          <p class="muted small">Messages are kept on this device so channels open instantly and survive a dropped connection.</p>
+          <div class="kv"><span>Cached now</span><b id="cache-size">—</b></div>
+          <button id="clear-cache" class="pill small-btn">Clear cached messages</button>
+          <p class="small muted">Clearing only affects this device. Whatever the server still holds is fetched again next time you open a channel.</p>
+        </section>
+
+        <section class="settings-panel hidden" data-panel="about">
+          <h2>About</h2>
+          <div class="kv"><span>Version</span><b id="app-version">—</b></div>
+          <div class="kv"><span>Source</span><code class="block-code">github.com/obelisk-app/obelisk-menhir</code></div>
+          <p class="small muted">Text channels over Nostr, hosted from your own computer and published through Tor. No media, no tracking, no accounts.</p>
+        </section>
       </div>
-      <p id="profile-error" class="error hidden"></p>
 
-      <h3>Identity</h3>
-      <div class="kv"><span>Your npub</span><code id="profile-npub" class="block-code"></code></div>
-      <div class="kv"><span>Signing with</span><b id="profile-signer">—</b></div>
-      <div class="row gap">
-        <button id="copy-npub" class="pill small-btn">Copy npub</button>
-        <button id="reveal-nsec" class="pill small-btn hidden">Show secret key</button>
-      </div>
-      <div id="nsec-box" class="hidden">
-        <p class="warn">Anyone holding this key is you. Never paste it anywhere you do not trust.</p>
-        <code id="nsec-value" class="block-code"></code>
-        <button id="copy-nsec" class="pill small-btn">Copy secret key</button>
-      </div>
-
-      <h3>Storage</h3>
-      <p class="muted small">Messages are kept on this device so channels open instantly and survive a dropped connection.</p>
-      <div class="kv"><span>Cached now</span><b id="cache-size">—</b></div>
-      <button id="clear-cache" class="pill small-btn">Clear cached messages</button>
-
-      <h3>About</h3>
-      <div class="kv"><span>Version</span><b id="app-version">—</b></div>
-      <div class="kv"><span>Source</span><code class="block-code">github.com/obelisk-app/obelisk-menhir</code></div>
-
-      <div class="row gap right">
-        <button id="logout-btn-settings" class="pill danger-inline">Log out</button>
+      <div class="settings-foot">
         <button class="pill primary" data-close="profile-modal">Done</button>
       </div>
     </div>
@@ -221,7 +265,19 @@
       <h3>Name &amp; topic</h3>
       <input id="ca-name" placeholder="Display name" maxlength="64" />
       <input id="ca-about" placeholder="Topic (optional)" maxlength="200" />
-      <button id="ca-save" class="pill primary">Save</button>
+
+      <h3>Type</h3>
+      <div id="ca-type" class="type-picker">
+        <label class="type-option">
+          <input type="radio" name="ca-type" value="chat" checked />
+          <span><b>Chat</b><span class="small muted">Everyone admitted to the server can post.</span></span>
+        </label>
+        <label class="type-option">
+          <input type="radio" name="ca-type" value="publication" />
+          <span><b>Publication</b><span class="small muted">Only admins post. Everyone else can reply to a post.</span></span>
+        </label>
+      </div>
+      <button id="ca-save" class="pill primary">Save changes</button>
 
       <h3>Members</h3>
       <div id="ca-members" class="wl-list"></div>
@@ -243,6 +299,16 @@
       <input id="cc-id" placeholder="id (a-z 0-9 - _), e.g. general" />
       <input id="cc-name" placeholder="Display name" />
       <input id="cc-about" placeholder="Topic (optional)" />
+      <div id="cc-type" class="type-picker">
+        <label class="type-option">
+          <input type="radio" name="cc-type" value="chat" checked />
+          <span><b>Chat</b><span class="small muted">Everyone admitted to the server can post.</span></span>
+        </label>
+        <label class="type-option">
+          <input type="radio" name="cc-type" value="publication" />
+          <span><b>Publication</b><span class="small muted">Only admins post. Everyone else can reply to a post.</span></span>
+        </label>
+      </div>
       <p id="cc-error" class="error hidden"></p>
       <div class="row gap right">
         <button class="pill" data-close="create-channel-modal">Cancel</button>
@@ -252,60 +318,91 @@
   </div>
 
   <div id="host-modal" class="modal hidden">
-    <div class="modal-card lc-card wide">
+    <div class="modal-card lc-card host-card">
       <h2>Host a server</h2>
-      <p class="muted small">Runs a Menhir relay on this computer, published as a Tor onion service. Keep the app running to keep your server online.</p>
+      <p class="muted small">Runs a Menhir relay on this computer. Keep the app running to keep your server online.</p>
+
+      <div id="host-starting" class="hidden">
+        <p class="muted">Starting your server… Tor can take a minute to build its first circuit.</p>
+      </div>
 
       <div id="host-stopped">
         <div id="host-tor-warning" class="blocker hidden">
-          <div class="blocker-title">⚠ Tor is required — and it isn't installed</div>
-          <p>Your server is published as a Tor onion service. Without Tor it would only exist on this computer, which is useless for chatting with other people.</p>
+          <div class="blocker-title">⚠ Tor is not installed</div>
+          <p>Tor is what gives your server an address reachable from anywhere without a domain or port forwarding. Install it, or untick it below and share your server on your own network instead.</p>
           <p class="blocker-cmd">macOS &nbsp;<code>brew install tor</code></p>
           <p class="blocker-cmd">Linux &nbsp;<code>sudo apt install tor</code></p>
-          <p class="small muted">Install it, then press Check again — you don't have to configure anything, Menhir runs Tor for you.</p>
           <button id="host-recheck-btn" class="pill">Check again</button>
         </div>
         <div id="host-form">
-          <input id="host-name" placeholder="Server name" value="My Menhir" />
+          <input id="host-name" placeholder="Server name" value="My Menhir" maxlength="40" />
           <label class="check"><input type="checkbox" id="host-use-tor" checked /> <span>Publish through Tor<br /><span class="small muted">A permanent onion address, reachable from anywhere. No domain or port forwarding.</span></span></label>
           <label class="check"><input type="checkbox" id="host-clearnet" /> <span>Also listen on my network<br /><span class="small muted">For a LAN, or behind a reverse proxy terminating TLS for your own domain. Plain ws:// over a hostile network is readable.</span></span></label>
+          <p id="host-start-note" class="small muted"></p>
           <button id="host-start-btn" class="pill primary">Start hosting</button>
         </div>
       </div>
 
-      <div id="host-running" class="hidden">
-        <div class="kv"><span>Status</span><b id="host-state">—</b></div>
-        <div class="kv"><span>Onion address</span><code id="host-onion" class="block-code">—</code></div>
-        <div class="kv hidden" id="host-lan-row"><span>On your network</span><code id="host-lan" class="block-code">—</code></div>
-        <div class="kv"><span>Share link</span><code id="host-share" class="block-code">—</code></div>
-        <div class="row gap">
-          <button id="host-share-qr" class="pill primary">▦ Show QR</button>
-          <button id="host-copy-share" class="pill">Copy</button>
-          <button id="host-open-local" class="pill">Open in app</button>
-        </div>
+      <div id="host-running" class="hidden host-grid">
+        <section class="host-col">
+          <h3>Your server</h3>
+          <div class="kv"><span>Status</span><b id="host-state">—</b></div>
+          <div class="kv"><span>Onion address</span><code id="host-onion" class="block-code">—</code></div>
+          <div class="kv hidden" id="host-lan-row"><span>On your network</span><code id="host-lan" class="block-code">—</code></div>
+          <div class="kv"><span>Share link</span><code id="host-share" class="block-code">—</code></div>
+          <div class="row gap wrap">
+            <button id="host-share-qr" class="pill primary">▦ Show QR</button>
+            <button id="host-copy-share" class="pill">Copy</button>
+            <button id="host-open-local" class="pill">Open in app</button>
+          </div>
 
-        <h3>The door</h3>
-        <p class="small muted">Close it once your people are in: existing members keep their access, but no invite code works any more.</p>
-        <label class="check"><input type="checkbox" id="host-locked" /> <span id="host-locked-label">Open — invite codes work</span></label>
+          <h3>The door</h3>
+          <p class="small muted">Close it once your people are in: existing members keep their access, but no invite code works any more.</p>
+          <label class="check"><input type="checkbox" id="host-locked" /> <span id="host-locked-label">Open — invite codes work</span></label>
 
-        <h3>Invitations</h3>
-        <p class="small muted">An invite whitelists whoever redeems it. Share the QR — scanning it joins your server in one step.</p>
-        <div class="row gap">
-          <button id="host-invite-btn" class="pill">Create invite (1 use)</button>
-          <button id="host-invite-qr" class="pill primary hidden">▦ Show QR</button>
-        </div>
-        <code id="host-invite-out" class="block-code hidden"></code>
-        <div id="host-invite-list" class="wl-list"></div>
-        <button id="host-revoke-all" class="pill small-btn hidden">Revoke all invites</button>
+          <h3>Whitelist</h3>
+          <p class="small muted">Everyone who may connect. Redeeming an invite adds a key here.</p>
+          <div class="row gap">
+            <input id="host-wl-input" class="grow" placeholder="npub1…" />
+            <button id="host-wl-add" class="pill">Add</button>
+          </div>
+          <div id="host-wl-list" class="wl-list"></div>
+        </section>
 
-        <h3>Whitelist</h3>
-        <div class="row gap">
-          <input id="host-wl-input" class="grow" placeholder="npub1…" />
-          <button id="host-wl-add" class="pill">Add</button>
-        </div>
-        <div id="host-wl-list" class="wl-list"></div>
+        <section class="host-col">
+          <h3>Invitations</h3>
+          <p class="small muted">An invite whitelists whoever redeems it. Share the QR — scanning it joins your server in one step.</p>
+          <div class="row gap wrap">
+            <label class="mini-field"><span>Uses</span>
+              <select id="host-invite-uses">
+                <option value="1" selected>1</option>
+                <option value="5">5</option>
+                <option value="25">25</option>
+                <option value="100">100</option>
+              </select>
+            </label>
+            <label class="mini-field"><span>Expires</span>
+              <select id="host-invite-expiry">
+                <option value="">never</option>
+                <option value="1">1 hour</option>
+                <option value="24" selected>24 hours</option>
+                <option value="168">7 days</option>
+              </select>
+            </label>
+            <button id="host-invite-btn" class="pill primary">Create invite</button>
+          </div>
+          <code id="host-invite-out" class="block-code hidden"></code>
+          <div class="row gap wrap">
+            <button id="host-invite-qr" class="pill hidden">▦ Show QR</button>
+            <button id="host-invite-copy" class="pill hidden">Copy invite</button>
+          </div>
+          <div id="host-invite-list" class="wl-list"></div>
+          <button id="host-revoke-all" class="pill small-btn hidden">Revoke all invites</button>
 
-        <button id="host-stop-btn" class="pill danger">Stop hosting</button>
+          <h3 class="danger-heading">Stop</h3>
+          <p class="small muted">Your onion address and all data stay on this computer — starting again gives you the same server.</p>
+          <button id="host-stop-btn" class="pill danger-inline">Stop hosting</button>
+        </section>
       </div>
 
       <p id="host-error" class="error hidden"></p>
@@ -314,6 +411,21 @@
       </div>
     </div>
   </div>
+
+  <!-- In-app confirmation. `window.confirm` cannot be trusted to draw inside
+       an app webview, and a silent no-op reads as a broken button. -->
+  <div id="confirm-modal" class="modal hidden">
+    <div class="modal-card lc-card narrow">
+      <h2 id="confirm-title">Are you sure?</h2>
+      <p id="confirm-body" class="muted small"></p>
+      <div class="row gap right">
+        <button id="confirm-cancel" class="pill">Cancel</button>
+        <button id="confirm-go" class="pill primary">Confirm</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast-stack" aria-live="polite"></div>
 
   <script src="bundle.js"></script>
 </body>

@@ -3,7 +3,8 @@
 Menhir started as the smallest thing that proves the idea: sovereign text
 channels, hosted from your own machine, reachable over Tor. That works now —
 onion hosting, invites, whitelist, three signing methods, unread and
-notifications, cached history, channel administration.
+notifications, cached history, channel administration, replies, emoji, and
+two channel types (chat and publication).
 
 This is the plan for what comes next, and what gets ported from
 [obelisk](https://github.com/obelisk-app/obelisk) (the full web client, called
@@ -52,10 +53,11 @@ Ported from obelisk, in the order that most changes daily use.
 
 | | Ported from | Notes |
 |---|---|---|
-| **Replies** | `MessageContent`, reply tags | The single biggest readability win in a busy channel. Cheap: an `e` tag and a quoted header. |
+| ~~Replies~~ | `MessageContent`, reply tags | ✅ Done. NIP-10 marked `e` tag, a quoted header, and the rule that makes publication channels work. |
+| ~~Emoji picker~~ | `EmojiPicker`, `recent-emojis.ts` | ✅ Done — Unicode only. Emoji are text, so nothing had to change on the wire. |
+| **Reactions** | kind 7 | Accepting kind 7 on the relay. Small, well-understood widening — the picker is already there. |
 | **Mentions + autocomplete** | `mentions.ts`, `MentionAutocomplete`, `MentionNavigator` | Needs the member list, which the relay already publishes as kind 39002. |
 | **Profile pictures and popovers** | `UserAvatar`, `ProfilePopover`, `NostrProfile` | Avatars are remote images — over Tor they must be cached hard and lazily fetched, or turned off by default. |
-| **Emoji picker + reactions** | `EmojiPicker`, `recent-emojis.ts`, kind 7 | Reactions mean accepting kind 7 on the relay. Small, well-understood widening. |
 | **Markdown, code blocks, spoilers** | `markdown.ts`, `CodeBlock`, `SpoilerText`, `remark-spoiler.ts` | Rendering only — no protocol change. Must stay strictly sanitised; the current client deliberately renders `textContent`. |
 | **Message editing** | — | Not in obelisk either. Decide deliberately rather than inherit. |
 | **History pagination** | `HistoryPaginationStatus`, `channel-scroll-anchor.ts` | Currently the client loads the most recent 200 and stops. Real channels outgrow that. |
@@ -80,9 +82,9 @@ storage and privacy questions answered first.
 |---|---|---|
 | **Attachments and images** | `attachments.ts`, `blossom.ts`, `ImageGallery` | Where do bytes live? A public Blossom host leaks membership of a private channel. Relay-local storage means the operator's laptop holds everyone's files. |
 | **Link previews** | `LinkPreview.tsx` | Fetching a preview reveals the reader's IP to the linked site unless it goes through Tor or the relay fetches it. |
-| **Custom emoji, stickers, media packs** | `relay-emojis.ts`, `personal-stickers.ts`, `media-packs.ts` | Same storage question, lower stakes. |
+| **Custom emoji, stickers, media packs** | `relay-emojis.ts`, `personal-stickers.ts`, `media-packs.ts` | Same storage question, lower stakes. The Unicode picker deliberately shipped without any of it. |
 | **Voice notes** | `voice-note-tags.ts` | Audio is large; a Tor circuit is not. |
-| **Forum view** | `ForumView.tsx` | Threaded reading. Depends on replies landing first. |
+| **Forum view** | `ForumView.tsx` | Publication channels are the first half: an admin's posts with replies gathered under each. The rest — a thread per post as its own channel, curated tags, sort and gallery views — needs child channels (`parent` tag) the relay does not model yet. |
 
 ## Phase 5 — beyond text
 
