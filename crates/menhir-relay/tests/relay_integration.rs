@@ -69,6 +69,39 @@ fn create_channel(keys: &Keys, id: &str, name: &str) -> Event {
     .unwrap()
 }
 
+fn create_publication(keys: &Keys, id: &str, name: &str) -> Event {
+    Event::sign(
+        EventTemplate {
+            kind: kinds::CREATE_GROUP,
+            tags: vec![
+                vec!["h".into(), id.into()],
+                vec!["name".into(), name.into()],
+                vec!["t".into(), "publication".into()],
+            ],
+            content: String::new(),
+            created_at: None,
+        },
+        keys,
+    )
+    .unwrap()
+}
+
+fn reply(keys: &Keys, channel: &str, parent: &str, text: &str) -> Event {
+    Event::sign(
+        EventTemplate {
+            kind: kinds::CHAT,
+            tags: vec![
+                vec!["h".into(), channel.into()],
+                vec!["e".into(), parent.into(), String::new(), "reply".into()],
+            ],
+            content: text.into(),
+            created_at: None,
+        },
+        keys,
+    )
+    .unwrap()
+}
+
 #[tokio::test]
 async fn operator_auth_create_channel_and_chat() {
     let operator = Keys::generate();
@@ -770,4 +803,127 @@ async fn admin_moderation_and_membership() {
         "member list is addressable — exactly one survives"
     );
     assert!(members[0].tag_values("p").contains(&member.pk_hex.as_str()));
+}
+
+#[tokio::test]
+async fn publication_channels_admit_posts_from_admins_and_replies_from_everyone() {
+    let operator = Keys::generate();
+    let (_handle, st, url) = start_relay("publication", &operator, false).await;
+
+    let mut op = Client::connect(&url, None).await.unwrap();
+    op.auth(&operator, T).await.unwrap();
+    let (ok, msg) = op
+        .publish(&create_publication(&operator, "notices", "Notices"), T)
+        .await
+        .unwrap();
+    assert!(ok, "create publication channel: {msg}");
+
+    // The type reaches clients on the relay-signed metadata.
+    let meta = op
+        .req_collect(
+            vec![Filter::new()
+                .kinds(vec![kinds::GROUP_METADATA])
+                .tag("d", vec!["notices".into()])],
+            T,
+        )
+        .await
+        .unwrap();
+    assert_eq!(meta[0].first_tag("t"), Some("publication"));
+
+    let post = chat(&operator, "notices", "the hall is closed on Tuesday");
+    let (ok, msg) = op.publish(&post, T).await.unwrap();
+    assert!(ok, "admin post: {msg}");
+
+    let member = Keys::generate();
+    st.db.whitelist_add(&member.pk_hex, "test").unwrap();
+    let mut mem = Client::connect(&url, None).await.unwrap();
+    mem.auth(&member, T).await.unwrap();
+
+    // A member cannot start a post…
+    let (ok, msg) = mem
+        .publish(&chat(&member, "notices", "buy my thing"), T)
+        .await
+        .unwrap();
+    assert!(!ok, "a member must not post at top level in a publication");
+    assert!(msg.contains("only admins post"), "got: {msg}");
+
+    // …but may reply to one.
+    let (ok, msg) = mem
+        .publish(&reply(&member, "notices", &post.id, "which Tuesday?"), T)
+        .await
+        .unwrap();
+    assert!(ok, "reply to a post: {msg}");
+
+    // A reply whose parent is not in this channel is not a way around the rule.
+    let elsewhere = chat(&operator, "notices", "unpublished");
+    let (ok, msg) = mem
+        .publish(&reply(&member, "notices", &elsewhere.id, "sneaky"), T)
+        .await
+        .unwrap();
+    assert!(!ok, "a reply to a non-existent post must be refused");
+    assert!(msg.contains("no post in this channel"), "got: {msg}");
+
+    // Promoting the member to admin lets them post at top level.
+    let promote = Event::sign(
+        EventTemplate {
+            kind: kinds::PUT_USER,
+            tags: vec![
+                vec!["h".into(), "notices".into()],
+                vec!["p".into(), member.pk_hex.clone(), "admin".into()],
+            ],
+            content: String::new(),
+            created_at: None,
+        },
+        &operator,
+    )
+    .unwrap();
+    let (ok, msg) = op.publish(&promote, T).await.unwrap();
+    assert!(ok, "promote: {msg}");
+    let (ok, msg) = mem
+        .publish(&chat(&member, "notices", "now I may post"), T)
+        .await
+        .unwrap();
+    assert!(ok, "admin post after promotion: {msg}");
+}
+
+#[tokio::test]
+async fn a_chat_channel_takes_replies_from_anyone() {
+    let operator = Keys::generate();
+    let (_handle, st, url) = start_relay("replies", &operator, false).await;
+
+    let mut op = Client::connect(&url, None).await.unwrap();
+    op.auth(&operator, T).await.unwrap();
+    op.publish(&create_channel(&operator, "general", "General"), T)
+        .await
+        .unwrap();
+    let first = chat(&operator, "general", "gm");
+    op.publish(&first, T).await.unwrap();
+
+    let member = Keys::generate();
+    st.db.whitelist_add(&member.pk_hex, "test").unwrap();
+    let mut mem = Client::connect(&url, None).await.unwrap();
+    mem.auth(&member, T).await.unwrap();
+
+    let answer = reply(&member, "general", &first.id, "gm to you too");
+    let (ok, msg) = mem.publish(&answer, T).await.unwrap();
+    assert!(ok, "reply in a chat channel: {msg}");
+
+    // The reply marker survives storage, so clients can thread history.
+    let history = mem
+        .req_collect(
+            vec![Filter::new()
+                .kinds(vec![kinds::CHAT])
+                .tag("h", vec!["general".into()])],
+            T,
+        )
+        .await
+        .unwrap();
+    let stored = history.iter().find(|e| e.id == answer.id).unwrap();
+    let marker = stored
+        .tags
+        .iter()
+        .find(|t| t.first().map(String::as_str) == Some("e"))
+        .unwrap();
+    assert_eq!(marker.get(1), Some(&first.id));
+    assert_eq!(marker.get(3).map(String::as_str), Some("reply"));
 }

@@ -47,12 +47,30 @@ echo "invite code: $CODE"
 "$BIN/menhir" redeem --nsec "$GUEST_NSEC" --code "$CODE"
 "$BIN/menhir" send --nsec "$GUEST_NSEC" --channel general --message "thanks for the invite!"
 
+echo "==> operator opens a publication channel"
+"$BIN/menhir" create-channel --nsec "$OP_NSEC" --id notices --name "Notices" --type publication
+POST=$("$BIN/menhir" send --nsec "$OP_NSEC" --channel notices --message "the hall is closed on Tuesday" \
+  | sed 's/.*(\(.*\))/\1/')
+
+echo "==> the guest tries to publish there (should be refused)"
+if "$BIN/menhir" send --nsec "$GUEST_NSEC" --channel notices --message "buy my thing" 2>"$WORK/err.txt"; then
+  echo "!! FAIL: a member published in a publication channel"; exit 1
+else
+  echo "refused as expected: $(head -1 "$WORK/err.txt")"
+fi
+
+echo "==> …but replying to the post is allowed"
+"$BIN/menhir" send --nsec "$GUEST_NSEC" --channel notices --message "which Tuesday?" --reply-to "$POST"
+
 echo
 echo "==> channels"
 "$BIN/menhir" channels --nsec "$OP_NSEC"
 echo
 echo "==> history"
 "$BIN/menhir" history --nsec "$OP_NSEC" --channel general
+echo
+echo "==> the publication channel, with the reply threaded"
+"$BIN/menhir" history --nsec "$OP_NSEC" --channel notices --json
 echo
 echo "==> relay info"
 "$BIN/menhir" admin --data-dir "$WORK/relay" info

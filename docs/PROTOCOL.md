@@ -9,16 +9,16 @@ Everything below is enforced server-side by `menhir-relay`.
 | Kind | Direction | Meaning |
 |---|---|---|
 | 0 | client → relay | Profile metadata (name shown in chat) |
-| 9 | client → relay | Plain-text chat message. Requires `["h", "<channel-id>"]` |
+| 9 | client → relay | Plain-text chat message. Requires `["h", "<channel-id>"]`. Optional `["e", <id>, "", "reply"]` + `["p", <author>]` to reply |
 | 9000 | client → relay | Put user (admin only): `["p", <pubkey>, <role?>]` tags |
 | 9001 | client → relay | Remove user (admin only) |
-| 9002 | client → relay | Edit channel metadata (admin only): `name` / `about` tags |
-| 9007 | client → relay | Create channel: `["h", id]` (+ optional `name`, `about`) |
+| 9002 | client → relay | Edit channel metadata (admin only): `name` / `about` / `t` tags |
+| 9007 | client → relay | Create channel: `["h", id]` (+ optional `name`, `about`, `t`) |
 | 9008 | client → relay | Delete channel (admin only) — purges its events |
 | 9021 / 9022 | client → relay | Join / leave a channel |
 | 22242 | client → relay | NIP-42 auth (via `AUTH` verb, `EVENT` also tolerated) |
 | 20284 | client → relay | **Menhir invite redemption** (ephemeral, custom): `content` = invite code |
-| 39000 | relay → client | Channel metadata (`d` = channel id, `name`, `about`, signed by the relay key) |
+| 39000 | relay → client | Channel metadata (`d` = channel id, `name`, `about`, `t` = channel type, signed by the relay key) |
 | 39001 | relay → client | Channel admins (`d` + `["p", pk, role]`) |
 | 39002 | relay → client | Channel members (`d` + `["p", pk]`) |
 
@@ -70,6 +70,12 @@ gone. On an equal `created_at`, the lowest id wins, per NIP-01, so replicas
 converge. Relay-generated channel metadata is stamped strictly newer than the
 last version instead, since membership can change several times in a second.
 
+**A reply must name a post in the same channel.** In a publication channel
+the reply marker is what lets a non-admin write at all, so an `e` tag
+pointing at an unknown id — or at a message in another channel — is refused
+rather than treated as a reply. Otherwise "reply to anything" would be the
+same as "post".
+
 ## Channel ids
 
 `h`/`d` values are 1–64 characters of `a-z 0-9 - _`. Chat into a channel that
@@ -115,6 +121,32 @@ obelisk://join?relay=ws://<address>&invite=<code>
 
 `relay` is required; `invite` is optional (without it the client just
 authenticates and hopes to be whitelisted already).
+
+## Channel types
+
+A channel carries a type on the `t` tag: `chat` (the default, and what an
+absent tag means) or `publication`. Clients set it on 9007 when creating a
+channel and on 9002 to change it; the relay stores it and republishes it on
+the 39000 metadata, on the same tag [obelisk](https://github.com/obelisk-app/obelisk)
+uses — so a client that has never heard of channel types simply sees an
+ordinary channel. Any other value collapses to `chat`, so an invented type
+cannot produce a channel with rules nobody implements.
+
+In a `publication` channel, a kind 9 with no reply marker is accepted only
+from a channel admin (or the operator). Everyone else must reply:
+
+```json
+{ "kind": 9, "tags": [["h", "notices"], ["e", "<post-id>", "", "reply"], ["p", "<author>"]], … }
+```
+
+and the relay checks that `<post-id>` is an event it holds carrying
+`["h", "notices"]`. Without that check "reply" would be a hole straight
+through the rule: any string in an `e` tag would turn a top-level post into
+a permitted one. Only the NIP-10 **marked** form counts — an unmarked or
+`root` `e` tag denotes thread membership, not a reply.
+
+Replies are accepted in `chat` channels too; there they are ordinary
+messages that happen to name what they answer.
 
 ## Group membership semantics (MVP)
 

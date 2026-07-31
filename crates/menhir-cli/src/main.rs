@@ -91,6 +91,10 @@ enum Cmd {
         channel: String,
         #[arg(long)]
         message: String,
+        /// Reply to this event id (NIP-10). Required for non-admins in a
+        /// publication channel.
+        #[arg(long)]
+        reply_to: Option<String>,
     },
     /// Create a new text channel.
     CreateChannel {
@@ -103,6 +107,9 @@ enum Cmd {
         name: Option<String>,
         #[arg(long)]
         about: Option<String>,
+        /// chat (anyone posts) or publication (admins post, anyone replies).
+        #[arg(long, value_name = "TYPE", default_value = "chat")]
+        r#type: String,
     },
     /// Join a channel (adds you to its member list).
     Join {
@@ -178,6 +185,16 @@ fn short_npub(pk_hex: &str) -> String {
 
 fn print_message(ev: &Event, json: bool) {
     if json {
+        // `reply_to` is the NIP-10 marked parent, so an agent can thread a
+        // conversation without re-deriving it from the raw tags.
+        let reply_to = ev
+            .tags
+            .iter()
+            .find(|t| {
+                t.first().map(String::as_str) == Some("e")
+                    && t.get(3).map(String::as_str) == Some("reply")
+            })
+            .and_then(|t| t.get(1));
         println!(
             "{}",
             json!({
@@ -186,6 +203,7 @@ fn print_message(ev: &Event, json: bool) {
                 "npub": nip19_encode("npub", &ev.pubkey),
                 "created_at": ev.created_at,
                 "channel": ev.first_tag("h"),
+                "reply_to": reply_to,
                 "content": ev.content,
             })
         );
@@ -308,12 +326,21 @@ async fn main() -> Result<()> {
                 let id = ev.first_tag("d").unwrap_or("?").to_string();
                 let name = ev.first_tag("name").unwrap_or(&id).to_string();
                 let about = ev.first_tag("about").unwrap_or("").to_string();
+                // No `t` tag means an ordinary chat channel — relays predating
+                // channel types publish metadata without one.
+                let kind = ev.first_tag("t").unwrap_or("chat").to_string();
                 if json {
-                    println!("{}", json!({ "id": id, "name": name, "about": about }));
-                } else if about.is_empty() {
-                    println!("#{id}  —  {name}");
+                    println!(
+                        "{}",
+                        json!({ "id": id, "name": name, "about": about, "type": kind })
+                    );
                 } else {
-                    println!("#{id}  —  {name}  ({about})");
+                    let marker = if kind == "publication" { "▤" } else { "#" };
+                    if about.is_empty() {
+                        println!("{marker}{id}  —  {name}");
+                    } else {
+                        println!("{marker}{id}  —  {name}  ({about})");
+                    }
                 }
             }
         }
@@ -370,13 +397,19 @@ async fn main() -> Result<()> {
             conn,
             channel,
             message,
+            reply_to,
         } => {
             let (mut client, keys) = connect_and_auth(&conn).await?;
             let keys = require_keys(keys)?;
+            let mut tags = vec![vec!["h".to_string(), channel.clone()]];
+            if let Some(parent) = reply_to {
+                // NIP-10 marked reply, the same shape obelisk publishes.
+                tags.push(vec!["e".into(), parent, String::new(), "reply".into()]);
+            }
             let ev = Event::sign(
                 EventTemplate {
                     kind: kinds::CHAT,
-                    tags: vec![vec!["h".into(), channel.clone()]],
+                    tags,
                     content: message,
                     created_at: None,
                 },
@@ -390,9 +423,13 @@ async fn main() -> Result<()> {
             id,
             name,
             about,
+            r#type,
         } => {
             let (mut client, keys) = connect_and_auth(&conn).await?;
             let keys = require_keys(keys)?;
+            if !matches!(r#type.as_str(), "chat" | "publication") {
+                bail!("--type must be chat or publication");
+            }
             let mut tags = vec![vec!["h".to_string(), id.clone()]];
             if let Some(name) = name {
                 tags.push(vec!["name".into(), name]);
@@ -400,6 +437,7 @@ async fn main() -> Result<()> {
             if let Some(about) = about {
                 tags.push(vec!["about".into(), about]);
             }
+            tags.push(vec!["t".into(), r#type]);
             let ev = Event::sign(
                 EventTemplate {
                     kind: kinds::CREATE_GROUP,

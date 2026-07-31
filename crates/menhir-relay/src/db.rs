@@ -36,8 +36,24 @@ pub struct GroupRow {
     pub id: String,
     pub name: String,
     pub about: String,
+    /// Channel type: `"chat"` or `"publication"`. See [`normalize_group_kind`].
+    pub kind: String,
     pub created_by: String,
     pub created_at: u64,
+}
+
+/// The channel types this relay knows about.
+///
+/// `chat` is an ordinary text channel: anyone admitted may post. In a
+/// `publication` channel only admins start a post — everyone else may reply to
+/// one, which is what makes it an announcement feed with discussion rather
+/// than a read-only wall. Unknown values collapse to `chat` so a client that
+/// invents a type cannot create a channel nobody can moderate.
+pub fn normalize_group_kind(kind: Option<&str>) -> String {
+    match kind.map(str::trim) {
+        Some("publication") => "publication".to_string(),
+        _ => "chat".to_string(),
+    }
 }
 
 impl Db {
@@ -82,6 +98,7 @@ impl Db {
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
                 about TEXT NOT NULL DEFAULT '',
+                kind TEXT NOT NULL DEFAULT 'chat',
                 created_by TEXT NOT NULL,
                 created_at INTEGER NOT NULL
             );
@@ -97,6 +114,19 @@ impl Db {
                 retired_at INTEGER NOT NULL
             );",
         )?;
+        // Databases created before channel types have no `kind` column. SQLite
+        // has no "ADD COLUMN IF NOT EXISTS", and the error for adding one that
+        // already exists is indistinguishable from a real failure only by its
+        // message — so ask the schema instead of guessing.
+        let has_kind = conn
+            .prepare("SELECT kind FROM groups_ LIMIT 1")
+            .map(|_| true)
+            .unwrap_or(false);
+        if !has_kind {
+            conn.execute_batch(
+                "ALTER TABLE groups_ ADD COLUMN kind TEXT NOT NULL DEFAULT 'chat';",
+            )?;
+        }
         Ok(Db {
             conn: Mutex::new(conn),
         })
@@ -444,12 +474,20 @@ impl Db {
         id: &str,
         name: &str,
         about: &str,
+        kind: &str,
         created_by: &str,
     ) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
         let n = conn.execute(
-            "INSERT OR IGNORE INTO groups_ (id, name, about, created_by, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![id, name, about, created_by, menhir_core::now() as i64],
+            "INSERT OR IGNORE INTO groups_ (id, name, about, kind, created_by, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                id,
+                name,
+                about,
+                normalize_group_kind(Some(kind)),
+                created_by,
+                menhir_core::now() as i64
+            ],
         )?;
         Ok(n > 0)
     }
@@ -459,6 +497,7 @@ impl Db {
         id: &str,
         name: Option<&str>,
         about: Option<&str>,
+        kind: Option<&str>,
     ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         if let Some(name) = name {
@@ -471,6 +510,12 @@ impl Db {
             conn.execute(
                 "UPDATE groups_ SET about = ?2 WHERE id = ?1",
                 params![id, about],
+            )?;
+        }
+        if let Some(kind) = kind {
+            conn.execute(
+                "UPDATE groups_ SET kind = ?2 WHERE id = ?1",
+                params![id, normalize_group_kind(Some(kind))],
             )?;
         }
         Ok(())
@@ -506,15 +551,16 @@ impl Db {
         let conn = self.conn.lock().unwrap();
         Ok(conn
             .query_row(
-                "SELECT id, name, about, created_by, created_at FROM groups_ WHERE id = ?1",
+                "SELECT id, name, about, kind, created_by, created_at FROM groups_ WHERE id = ?1",
                 params![id],
                 |r| {
                     Ok(GroupRow {
                         id: r.get(0)?,
                         name: r.get(1)?,
                         about: r.get(2)?,
-                        created_by: r.get(3)?,
-                        created_at: r.get::<_, i64>(4)? as u64,
+                        kind: r.get(3)?,
+                        created_by: r.get(4)?,
+                        created_at: r.get::<_, i64>(5)? as u64,
                     })
                 },
             )
@@ -524,18 +570,35 @@ impl Db {
     pub fn group_list(&self) -> Result<Vec<GroupRow>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, name, about, created_by, created_at FROM groups_ ORDER BY created_at",
+            "SELECT id, name, about, kind, created_by, created_at FROM groups_ ORDER BY created_at",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok(GroupRow {
                 id: r.get(0)?,
                 name: r.get(1)?,
                 about: r.get(2)?,
-                created_by: r.get(3)?,
-                created_at: r.get::<_, i64>(4)? as u64,
+                kind: r.get(3)?,
+                created_by: r.get(4)?,
+                created_at: r.get::<_, i64>(5)? as u64,
             })
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// True when `event_id` is a stored event carrying `["h", group_id]`.
+    ///
+    /// Used to bind a reply to the channel it claims to be in: without it a
+    /// non-admin could "reply" to an event id from another channel — or one
+    /// that never existed — and land a top-level post in a publication feed.
+    pub fn event_in_group(&self, event_id: &str, group_id: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row(
+                "SELECT 1 FROM tags WHERE event_id = ?1 AND name = 'h' AND value = ?2",
+                params![event_id, group_id],
+                |_| Ok(true),
+            )
+            .unwrap_or(false))
     }
 
     pub fn member_add(&self, group_id: &str, pubkey: &str, role: &str) -> Result<()> {

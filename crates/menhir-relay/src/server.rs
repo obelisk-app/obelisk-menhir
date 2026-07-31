@@ -394,6 +394,21 @@ fn is_admin(st: &RelayState, group_id: &str, pubkey: &str) -> bool {
         || st.db.is_group_admin(group_id, pubkey).unwrap_or(false)
 }
 
+/// The event a chat message replies to, per NIP-10: an `e` tag whose fourth
+/// item is the `reply` marker. An unmarked or `root` `e` tag denotes thread
+/// membership rather than a direct reply, so it does not count here.
+fn reply_parent(ev: &Event) -> Option<&str> {
+    ev.tags
+        .iter()
+        .find(|t| {
+            t.first().map(String::as_str) == Some("e")
+                && t.get(3).map(String::as_str) == Some("reply")
+        })
+        .and_then(|t| t.get(1))
+        .map(String::as_str)
+        .filter(|id| !id.is_empty())
+}
+
 fn valid_group_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 64
@@ -499,8 +514,23 @@ fn handle_event(st: &RelayState, ctx: &mut ConnCtx, ev: Event) -> Vec<Value> {
                     .first_tag("h")
                     .ok_or("invalid: chat needs an h tag")?
                     .to_string();
-                if st.db.group_get(&group_id).map_err(db_err)?.is_none() {
+                let Some(group) = st.db.group_get(&group_id).map_err(db_err)? else {
                     return Err("invalid: unknown channel".into());
+                };
+                // A publication channel is an announcement feed: only admins
+                // start a post, but anyone admitted may reply to one. The
+                // reply must point at an event that really is in this channel,
+                // or "reply" would be a hole straight through the rule.
+                if group.kind == "publication" && !is_admin(st, &group_id, &ev.pubkey) {
+                    let parent = reply_parent(&ev)
+                        .ok_or("restricted: only admins post in a publication channel — reply to a post to join the discussion")?;
+                    if !st
+                        .db
+                        .event_in_group(parent, &group_id)
+                        .map_err(db_err)?
+                    {
+                        return Err("invalid: reply points at no post in this channel".into());
+                    }
                 }
                 // First message in a channel makes you a listed member.
                 if st
@@ -531,9 +561,10 @@ fn handle_event(st: &RelayState, ctx: &mut ConnCtx, ev: Event) -> Vec<Value> {
                     .filter(|n| !n.is_empty())
                     .unwrap_or_else(|| group_id.clone());
                 let about = ev.first_tag("about").unwrap_or("").to_string();
+                let kind = crate::db::normalize_group_kind(ev.first_tag("t"));
                 if !st
                     .db
-                    .group_create(&group_id, &name, &about, &ev.pubkey)
+                    .group_create(&group_id, &name, &about, &kind, &ev.pubkey)
                     .map_err(db_err)?
                 {
                     return Err("duplicate: channel already exists".into());
@@ -607,6 +638,7 @@ fn handle_event(st: &RelayState, ctx: &mut ConnCtx, ev: Event) -> Vec<Value> {
                                 &group_id,
                                 ev.first_tag("name"),
                                 ev.first_tag("about"),
+                                ev.first_tag("t"),
                             )
                             .map_err(db_err)?;
                     }
@@ -672,6 +704,9 @@ pub fn group_meta_events(st: &RelayState, group_id: &str) -> anyhow::Result<Vec<
         vec!["d".to_string(), group.id.clone()],
         vec!["name".to_string(), group.name.clone()],
         vec!["open".to_string()],
+        // Channel type, on the same `t` tag obelisk uses, so a client that
+        // does not know the type still sees an ordinary channel.
+        vec!["t".to_string(), group.kind.clone()],
     ];
     if !group.about.is_empty() {
         meta_tags.push(vec!["about".to_string(), group.about.clone()]);
