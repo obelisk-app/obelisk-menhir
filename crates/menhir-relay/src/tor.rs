@@ -140,6 +140,117 @@ fn usable_socks_port(preferred: u16) -> u16 {
         .unwrap_or(preferred)
 }
 
+/// Is this process still around?
+fn process_alive(pid: i32) -> bool {
+    #[cfg(unix)]
+    {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+fn signal(pid: i32, sig: &str) {
+    #[cfg(unix)]
+    {
+        let _ = std::process::Command::new("kill")
+            .args([sig, &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (pid, sig);
+    }
+}
+
+/// Find a running Tor launched with this directory's torrc.
+///
+/// Matches the full command line against our own torrc path, so it can only
+/// ever identify a Tor this app started — a system Tor or Tor Browser has a
+/// different config path and is never matched.
+fn find_tor_by_torrc(tor_dir: &Path) -> Option<i32> {
+    #[cfg(unix)]
+    {
+        let torrc = tor_dir.join("torrc");
+        let out = std::process::Command::new("pgrep")
+            .args(["-f", &torrc.display().to_string()])
+            .output()
+            .ok()?;
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| l.trim().parse::<i32>().ok())
+            .find(|pid| *pid != std::process::id() as i32)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tor_dir;
+        None
+    }
+}
+
+/// Shut down a Tor left running from a previous session.
+///
+/// Tor takes an exclusive lock on its data directory and refuses to start when
+/// another process holds it — "It looks like another Tor process is running
+/// with the same data directory". That process is ours: force-quitting the app
+/// (or a crash) skips the kill-on-drop that would normally take it with us, so
+/// it outlives the app and blocks every later attempt to host.
+///
+/// The pid comes from the `PidFile` written into the torrc, so only a Tor this
+/// app started is ever signalled — never a system Tor or Tor Browser.
+async fn reap_previous_tor(tor_dir: &Path) {
+    let pid_path = tor_dir.join("tor.pid");
+    let recorded = std::fs::read_to_string(&pid_path)
+        .ok()
+        .and_then(|t| t.trim().parse::<i32>().ok());
+    // Versions before the PidFile existed left orphans with nothing to
+    // identify them by, so fall back to finding a Tor whose command line
+    // names *this* torrc — precise enough never to touch another Tor.
+    let Some(pid) = recorded.or_else(|| find_tor_by_torrc(tor_dir)) else {
+        let _ = std::fs::remove_file(&pid_path);
+        return;
+    };
+    if !process_alive(pid) {
+        let _ = std::fs::remove_file(&pid_path);
+        return;
+    }
+
+    tracing::info!(pid, "a Tor from a previous run is still holding the data directory; stopping it");
+    signal(pid, "-TERM");
+    for _ in 0..40 {
+        if !process_alive(pid) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    if process_alive(pid) {
+        signal(pid, "-KILL");
+        for _ in 0..20 {
+            if !process_alive(pid) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+    let _ = std::fs::remove_file(&pid_path);
+    // Only now: while the owner lives its lock is real, and removing the file
+    // out from under it would let two Tors share one data directory.
+    if !process_alive(pid) {
+        let _ = std::fs::remove_file(tor_dir.join("state").join("lock"));
+    }
+}
+
 /// Tor rejects a data or hidden-service directory that group/other can reach.
 fn tighten(path: &Path) -> Result<()> {
     #[cfg(unix)]
@@ -167,6 +278,9 @@ pub async fn start(opts: TorOptions) -> Result<TorHandle> {
     // applies the umask (usually 0755), so tighten explicitly.
     tighten(&opts.tor_dir)?;
     tighten(&state_dir)?;
+    // Before anything else: a Tor we started previously may still be holding
+    // this data directory, which makes the new one refuse to start.
+    reap_previous_tor(&opts.tor_dir).await;
 
     let socks_port = usable_socks_port(opts.socks_port);
     if socks_port != opts.socks_port {
@@ -176,14 +290,18 @@ pub async fn start(opts: TorOptions) -> Result<TorHandle> {
             "SOCKS port was busy; using another"
         );
     }
+    // PidFile makes the process identifiable on the next run, so a Tor
+    // orphaned by a force-quit can be cleaned up instead of blocking hosting
+    // forever. RunAsDaemon 0 keeps it in the foreground where we can watch it.
     let mut torrc = format!(
-        "SocksPort {}\nDataDirectory {}\nLog notice stdout\n",
+        "SocksPort {}\nDataDirectory {}\nPidFile {}\nRunAsDaemon 0\nLog notice stdout\n",
         if socks_port == 0 {
             "0".to_string()
         } else {
             format!("127.0.0.1:{socks_port}")
         },
         quote_path(&state_dir),
+        quote_path(&opts.tor_dir.join("tor.pid")),
     );
     if let Some(target_port) = opts.hidden_service_target {
         let hs_dir = hidden_service_dir(&opts.tor_dir);
