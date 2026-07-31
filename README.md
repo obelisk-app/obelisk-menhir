@@ -118,6 +118,7 @@ macOS note: install prerequisites with `brew install rust node` plus Xcode comma
 - **Channels**: NIP-29 subset. Clients send kind 9 chat (`h` tag), kind 9007 create, 9021/9022 join/leave, 9000-9002/9008 moderation; the relay answers with relay-signed 39000/39001/39002 metadata. See [docs/PROTOCOL.md](docs/PROTOCOL.md).
 - **Text only**: the relay rejects every other kind and caps content at 4 KB. No media, no formatting — rendered as plain text.
 - **Server isolation**: the client binds one relay at a time; events from different servers never mix.
+- **Tor everywhere**: desktop drives the system `tor` and publishes your onion service; Android embeds [arti](https://gitlab.torproject.org/tpo/core/arti) (Tor in Rust) in-process, so onion servers work on a phone with nothing to install. Either way a loopback bridge fronts it, so the webview dials `.onion` like any other host.
 
 ## Repo layout
 
@@ -136,7 +137,7 @@ docs/                  spec, protocol, notes
 - Tor is used from the system, not bundled. Production installers should bundle it (see spec §Desktop packaging).
 - No media, no formatting, no DMs, no voice, no reactions — text channels only.
 - Groups are open inside a whitelisted relay; fine-grained private groups come later.
-- Android is a client. Hosting stays desktop-only, and `.onion` needs the desktop app's Tor — [docs/known-limitations.md](docs/known-limitations.md) covers the routes to on-device Tor (arti, Orbot, bundled tor-android).
+- Android is a client: it reaches `.onion` servers fine (Tor is embedded — see below), but hosting stays desktop-only, since Android kills long-running services and arti cannot publish an onion service yet.
 
 ## Testing
 
