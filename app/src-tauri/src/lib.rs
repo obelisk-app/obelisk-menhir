@@ -9,6 +9,12 @@ mod host;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Must happen before anything touches TLS. rustls 0.23 will not guess a
+    // crypto provider when several are present in the graph — it panics on
+    // first use instead, and a panic inside a Tauri command leaves its promise
+    // unresolved, which surfaces as the UI hanging with no error at all.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     tauri::Builder::default()
         .setup(|app| {
             host::setup(app);

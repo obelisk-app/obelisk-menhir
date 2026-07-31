@@ -88,10 +88,23 @@ fn spawn_ws_task<S>(
     });
 }
 
+/// Install a rustls crypto provider exactly once.
+///
+/// rustls 0.23 will not choose between backends when several are present in
+/// the dependency graph — it panics the first time TLS is used. That turns a
+/// `wss://` connection into a crash rather than an error, so pick one up front.
+fn ensure_crypto_provider() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
 impl Client {
     /// Connect to a relay. If `socks5_proxy` is given (e.g. `127.0.0.1:9050`),
     /// the TCP connection is dialed through it — required for `.onion` relays.
     pub async fn connect(url: &str, socks5_proxy: Option<&str>) -> Result<Client> {
+        ensure_crypto_provider();
         let (out_tx, out_rx) = mpsc::unbounded_channel::<String>();
         let (in_tx, in_rx) = mpsc::unbounded_channel::<Value>();
 

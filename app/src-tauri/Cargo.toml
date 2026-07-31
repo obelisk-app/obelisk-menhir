@@ -23,6 +23,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"
+# rustls 0.23 refuses to pick a crypto backend when more than one is present
+# in the dependency graph, and *panics* on first use. A panic inside a Tauri
+# command never resolves its promise, so the UI just hangs — see run().
+rustls = { version = "0.23", features = ["ring"] }
 
 # Hosting is desktop-only (Android would kill a long-running server anyway),
 # so the relay, the managed `tor` process, and the Nostr core live here.
@@ -37,21 +41,23 @@ tokio-socks = "0.5"
 # desktop drives the system Tor over SOCKS, mobile embeds arti (Tor in Rust)
 # in-process so there is nothing to install.
 [target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
-# No "compression": it pulls in zstd/lzma C sources, which would make the
-# Android build need a cross C toolchain. Directory documents are fetched
-# uncompressed instead — a little more bandwidth, no native build step.
+# static-sqlite: arti's directory cache is sqlite-backed and the NDK ships no
+# libsqlite3 to link against, so compile it in. No "compression": it pulls in
+# zstd/lzma C sources for a bandwidth saving we don't need.
 arti-client = { version = "0.44", default-features = false, features = [
     "tokio",
     "rustls",
     "onion-service-client",
+    "static-sqlite",
 ] }
 tor-rtcompat = { version = "0.44", default-features = false, features = ["tokio", "rustls"] }
 futures = "0.3"
-# arti's directory cache is sqlite-backed, and the NDK ships no libsqlite3 to
-# link against. Depending on it here with "bundled" makes the transitive
-# rusqlite compile SQLite from source instead (needs the NDK's clang as CC —
-# scripts/build-android.sh exports it).
-rusqlite = { version = "0.37", features = ["bundled"] }
+# Surfaces arti's tracing output in logcat — without it a failure inside Tor
+# is invisible on a phone.
+android_logger = "0.14"
+log = "0.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [profile.release]
 strip = true

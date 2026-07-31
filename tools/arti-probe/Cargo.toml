@@ -1,0 +1,18 @@
+# Standalone so it never becomes a dependency of the shipped app.
+[workspace]
+
+[package]
+name = "arti-probe"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Exercises the exact arti code path the mobile app uses, on a host where the errors are visible"
+
+[dependencies]
+arti-client = { version = "0.44", default-features = false, features = ["tokio", "rustls", "onion-service-client"] }
+tor-rtcompat = { version = "0.44", default-features = false, features = ["tokio", "rustls"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+rustls = { version = "0.23", features = ["ring"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
