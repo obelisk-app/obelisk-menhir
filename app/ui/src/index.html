@@ -82,6 +82,7 @@
       <div id="server-header">
         <div class="row gap">
           <div id="server-name" class="grow">—</div>
+          <button id="server-settings-btn" class="icon-btn hidden" title="Rename or remove this server">⚙</button>
           <button id="server-qr-btn" class="icon-btn hidden" title="Show this server as a QR">▦</button>
         </div>
         <div id="server-status" class="muted small">not connected</div>
@@ -99,6 +100,7 @@
       <div id="chat-header">
         <button id="back-btn" class="icon-btn">‹</button>
         <span id="chat-title" class="grow">Pick a channel</span>
+        <button id="channel-admin-btn" class="icon-btn hidden" title="Channel settings (admin)">⚙</button>
       </div>
       <div id="messages"></div>
       <div id="composer" class="hidden">
@@ -116,6 +118,7 @@
       <button id="scan-qr-btn" class="pill primary wide-btn">▦ Scan a QR code</button>
       <p class="small muted or-line">or paste it</p>
       <input id="add-server-input" placeholder="obelisk://join?relay=ws://…onion&invite=CODE" />
+      <input id="add-server-name" placeholder="Name it (optional — the server can tell us its own)" maxlength="40" />
       <p id="add-server-error" class="error hidden"></p>
       <div class="row gap right">
         <button class="pill" data-close="add-server-modal">Cancel</button>
@@ -144,6 +147,7 @@
       <p class="muted small">Point another phone's camera at this, or send the link.</p>
       <div class="qr-wrap"><canvas id="share-qr"></canvas></div>
       <code id="qr-text" class="block-code"></code>
+      <p id="qr-note" class="warn hidden"></p>
       <div class="row gap right">
         <button id="qr-copy" class="pill">Copy link</button>
         <button class="pill" data-close="qr-modal">Close</button>
@@ -151,18 +155,84 @@
     </div>
   </div>
 
-  <div id="profile-modal" class="modal hidden">
+  <div id="server-settings-modal" class="modal hidden">
     <div class="modal-card lc-card">
-      <h2>Your profile</h2>
-      <p class="muted small">This is the name other people see in channels.</p>
+      <h2>Server settings</h2>
+      <input id="server-rename" placeholder="Server name" maxlength="40" />
+      <p class="small muted">Only you see this name. Leave it empty to use whatever the server calls itself.</p>
+      <div class="kv"><span>Address</span><code id="server-address" class="block-code"></code></div>
+      <p id="server-settings-error" class="error hidden"></p>
+      <div class="row gap right">
+        <button id="server-remove" class="pill danger-inline">Remove server</button>
+        <button class="pill" data-close="server-settings-modal">Cancel</button>
+        <button id="server-rename-save" class="pill primary">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="profile-modal" class="modal hidden">
+    <div class="modal-card lc-card wide">
+      <h2>Settings</h2>
+
+      <h3>Profile</h3>
+      <p class="muted small">The name other people see in channels. Published to the server you are connected to.</p>
       <input id="profile-name" placeholder="Display name" maxlength="64" />
       <input id="profile-about" placeholder="About you (optional)" maxlength="200" />
+      <div class="row gap">
+        <button id="profile-save" class="pill primary">Save profile</button>
+        <span id="profile-saved" class="muted small hidden">saved</span>
+      </div>
+      <p id="profile-error" class="error hidden"></p>
+
+      <h3>Identity</h3>
       <div class="kv"><span>Your npub</span><code id="profile-npub" class="block-code"></code></div>
       <div class="kv"><span>Signing with</span><b id="profile-signer">—</b></div>
-      <p id="profile-error" class="error hidden"></p>
+      <div class="row gap">
+        <button id="copy-npub" class="pill small-btn">Copy npub</button>
+        <button id="reveal-nsec" class="pill small-btn hidden">Show secret key</button>
+      </div>
+      <div id="nsec-box" class="hidden">
+        <p class="warn">Anyone holding this key is you. Never paste it anywhere you do not trust.</p>
+        <code id="nsec-value" class="block-code"></code>
+        <button id="copy-nsec" class="pill small-btn">Copy secret key</button>
+      </div>
+
+      <h3>Storage</h3>
+      <p class="muted small">Messages are kept on this device so channels open instantly and survive a dropped connection.</p>
+      <div class="kv"><span>Cached now</span><b id="cache-size">—</b></div>
+      <button id="clear-cache" class="pill small-btn">Clear cached messages</button>
+
+      <h3>About</h3>
+      <div class="kv"><span>Version</span><b id="app-version">—</b></div>
+      <div class="kv"><span>Source</span><code class="block-code">github.com/obelisk-app/obelisk-menhir</code></div>
+
       <div class="row gap right">
-        <button class="pill" data-close="profile-modal">Cancel</button>
-        <button id="profile-save" class="pill primary">Save</button>
+        <button id="logout-btn-settings" class="pill danger-inline">Log out</button>
+        <button class="pill primary" data-close="profile-modal">Done</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="channel-admin-modal" class="modal hidden">
+    <div class="modal-card lc-card wide">
+      <h2>Channel settings</h2>
+      <p class="muted small">You are an admin of this channel. Changes are signed by you and enforced by the server.</p>
+
+      <h3>Name &amp; topic</h3>
+      <input id="ca-name" placeholder="Display name" maxlength="64" />
+      <input id="ca-about" placeholder="Topic (optional)" maxlength="200" />
+      <button id="ca-save" class="pill primary">Save</button>
+
+      <h3>Members</h3>
+      <div id="ca-members" class="wl-list"></div>
+
+      <h3 class="danger-heading">Danger</h3>
+      <p class="muted small">Deleting a channel erases its messages and retires the id — it can never be created again on this server.</p>
+      <button id="ca-delete" class="pill danger-inline">Delete this channel</button>
+
+      <p id="ca-error" class="error hidden"></p>
+      <div class="row right">
+        <button class="pill" data-close="channel-admin-modal">Close</button>
       </div>
     </div>
   </div>
@@ -212,6 +282,10 @@
           <button id="host-open-local" class="pill">Open in app</button>
         </div>
 
+        <h3>The door</h3>
+        <p class="small muted">Close it once your people are in: existing members keep their access, but no invite code works any more.</p>
+        <label class="check"><input type="checkbox" id="host-locked" /> <span id="host-locked-label">Open — invite codes work</span></label>
+
         <h3>Invitations</h3>
         <p class="small muted">An invite whitelists whoever redeems it. Share the QR — scanning it joins your server in one step.</p>
         <div class="row gap">
@@ -219,6 +293,8 @@
           <button id="host-invite-qr" class="pill primary hidden">▦ Show QR</button>
         </div>
         <code id="host-invite-out" class="block-code hidden"></code>
+        <div id="host-invite-list" class="wl-list"></div>
+        <button id="host-revoke-all" class="pill small-btn hidden">Revoke all invites</button>
 
         <h3>Whitelist</h3>
         <div class="row gap">

@@ -157,8 +157,11 @@ code {
 
 /* ---------- app shell ---------- */
 
-#app-screen { display: flex; height: 100%; overflow: hidden; }
+/* --app-h tracks the visible viewport (set from visualViewport in main.js), so
+   an on-screen keyboard shrinks the layout instead of shoving it upwards. */
+#app-screen { display: flex; height: var(--app-h, 100%); overflow: hidden; }
 #app-screen.hidden { display: none; }
+#login-screen { height: var(--app-h, 100%); }
 
 #server-rail {
   width: var(--rail);
@@ -311,9 +314,15 @@ code {
 .check { display: flex; gap: 10px; align-items: flex-start; font-size: 14px; margin: 12px 0; line-height: 1.4; cursor: pointer; }
 .check input { width: auto; margin: 2px 0 0; flex-shrink: 0; }
 
-.wl-list { max-height: 150px; overflow-y: auto; margin-top: 8px; }
+.wl-list { max-height: 170px; overflow-y: auto; margin-top: 8px; }
 .wl-item { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 5px 0; font-size: 12px; }
-.wl-item button { background: none; border: none; color: var(--lc-red); cursor: pointer; flex-shrink: 0; }
+.wl-item button { background: none; border: none; color: var(--lc-red); cursor: pointer; flex-shrink: 0; font-size: 12px; }
+.wl-item code { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.link-btn { background: none; border: none; color: var(--lc-green) !important; cursor: pointer; font-size: 12px; }
+
+/* Destructive, but sitting inline with ordinary buttons rather than shouting. */
+.pill.danger-inline { border-color: var(--lc-red); color: var(--lc-red); margin-right: auto; }
+.danger-heading { color: var(--lc-red) !important; }
 
 /* the "install Tor first" blocker */
 .blocker {

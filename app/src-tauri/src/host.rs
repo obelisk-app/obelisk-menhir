@@ -21,6 +21,8 @@ const TOR_MISSING: &str = "Tor is not installed, so nobody outside this computer
 #[derive(Default)]
 pub struct NodeInner {
     relay: Option<server::RelayHandle>,
+    /// Live relay state, kept so the door can be locked without a restart.
+    relay_state: Option<server::Shared>,
     relay_port: u16,
     tor: Option<tor::TorHandle>,
     onion: Option<String>,
@@ -53,6 +55,23 @@ fn whitelist_npubs(dir: &PathBuf) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn invite_rows(dir: &PathBuf) -> Vec<crate::InviteRow> {
+    Db::open(&dir.join("relay.sqlite"))
+        .and_then(|db| db.invite_list())
+        .map(|invites| {
+            invites
+                .into_iter()
+                .map(|i| crate::InviteRow {
+                    code: i.code,
+                    uses: i.uses,
+                    max_uses: i.max_uses,
+                    expires_at: i.expires_at,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn status_of(inner: &NodeInner, dir: &PathBuf) -> HostStatus {
     let tor_available = tor::tor_available();
     let running = inner.relay.is_some();
@@ -80,6 +99,8 @@ fn status_of(inner: &NodeInner, dir: &PathBuf) -> HostStatus {
             "local only (Tor not installed)".into()
         },
         whitelist: if running { whitelist_npubs(dir) } else { vec![] },
+        locked: inner.relay_state.as_ref().map(|st| st.is_locked()).unwrap_or(false),
+        invites: if running { invite_rows(dir) } else { vec![] },
     }
 }
 
@@ -116,7 +137,7 @@ pub async fn host_start(
     save_config(&dir, &cfg).map_err(|e| e.to_string())?;
 
     // The configured port may be taken by another process — fall back to ephemeral.
-    let (handle, _st) = match server::start(&dir, cfg.clone()).await {
+    let (handle, relay_state) = match server::start(&dir, cfg.clone()).await {
         Ok(r) => r,
         Err(_) => {
             let mut retry = cfg.clone();
@@ -126,6 +147,7 @@ pub async fn host_start(
     };
     inner.relay_port = handle.port;
     inner.relay = Some(handle);
+    inner.relay_state = Some(relay_state);
     inner.name = cfg.name.clone();
 
     if use_tor && tor::tor_available() {
@@ -160,6 +182,7 @@ pub async fn host_stop(app: AppHandle, state: State<'_, NodeState>) -> Result<Ho
     if let Some(relay) = inner.relay.take() {
         relay.stop().await;
     }
+    inner.relay_state = None;
     inner.onion = None;
     if let Some(tor_handle) = inner.tor.take() {
         tor_handle.stop().await;
@@ -210,6 +233,50 @@ pub async fn host_invite_create(
         share_link: format!("obelisk://join?relay={relay_ref}&invite={}", invite.code),
         code: invite.code,
     })
+}
+
+/// Close (or reopen) the door: stop honouring invite codes without touching
+/// anyone's existing access. Persisted, so a restart keeps the door shut.
+#[tauri::command]
+pub async fn host_set_locked(
+    app: AppHandle,
+    state: State<'_, NodeState>,
+    locked: bool,
+) -> Result<HostStatus, String> {
+    let dir = host_dir(&app)?;
+    let inner = state.0.lock().await;
+    let Some(relay_state) = inner.relay_state.as_ref() else {
+        return Err("start hosting first".into());
+    };
+    relay_state.set_locked(locked);
+    let mut cfg = load_config(&dir).map_err(|e| e.to_string())?;
+    cfg.locked = locked;
+    save_config(&dir, &cfg).map_err(|e| e.to_string())?;
+    Ok(status_of(&inner, &dir))
+}
+
+/// Revoke one invite code, or every outstanding one when `code` is None.
+#[tauri::command]
+pub async fn host_invite_revoke(
+    app: AppHandle,
+    state: State<'_, NodeState>,
+    code: Option<String>,
+) -> Result<HostStatus, String> {
+    let dir = host_dir(&app)?;
+    let inner = state.0.lock().await;
+    if inner.relay.is_none() {
+        return Err("start hosting first".into());
+    }
+    let db = Db::open(&dir.join("relay.sqlite")).map_err(|e| e.to_string())?;
+    match code {
+        Some(code) => {
+            db.invite_revoke(&code).map_err(|e| e.to_string())?;
+        }
+        None => {
+            db.invite_revoke_all().map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(status_of(&inner, &dir))
 }
 
 #[tauri::command]

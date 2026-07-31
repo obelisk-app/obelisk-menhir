@@ -530,6 +530,118 @@ async fn non_canonical_hex_pubkeys_are_rejected() {
     );
 }
 
+/// Creating a channel is not an operator privilege: anyone the relay admits
+/// can make one from an ordinary client, and becomes its admin.
+#[tokio::test]
+async fn any_member_can_create_a_channel_and_administer_it() {
+    let operator = Keys::generate();
+    let (_handle, st, url) = start_relay("usercreate", &operator, false).await;
+
+    let member = Keys::generate();
+    st.db.whitelist_add(&member.pk_hex, "test").unwrap();
+    let mut mem = Client::connect(&url, None).await.unwrap();
+    mem.auth(&member, T).await.unwrap();
+
+    let (ok, msg) = mem
+        .publish(&create_channel(&member, "watercooler", "Watercooler"), T)
+        .await
+        .unwrap();
+    assert!(ok, "a plain member must be able to create a channel: {msg}");
+
+    // …and is its admin, so moderation there is theirs.
+    let rename = Event::sign(
+        EventTemplate {
+            kind: kinds::EDIT_METADATA,
+            tags: vec![
+                vec!["h".into(), "watercooler".into()],
+                vec!["name".into(), "Water Cooler".into()],
+            ],
+            content: String::new(),
+            created_at: None,
+        },
+        &member,
+    )
+    .unwrap();
+    let (ok, msg) = mem.publish(&rename, T).await.unwrap();
+    assert!(ok, "the creator administers their own channel: {msg}");
+
+    let meta = mem
+        .req_collect(
+            vec![Filter::new()
+                .kinds(vec![kinds::GROUP_METADATA])
+                .tag("d", vec!["watercooler".into()])],
+            T,
+        )
+        .await
+        .unwrap();
+    assert_eq!(meta.len(), 1);
+    assert_eq!(meta[0].first_tag("name"), Some("Water Cooler"));
+
+    // A different member cannot rename someone else's channel.
+    let outsider = Keys::generate();
+    st.db.whitelist_add(&outsider.pk_hex, "test").unwrap();
+    let mut out = Client::connect(&url, None).await.unwrap();
+    out.auth(&outsider, T).await.unwrap();
+    let hijack = Event::sign(
+        EventTemplate {
+            kind: kinds::EDIT_METADATA,
+            tags: vec![
+                vec!["h".into(), "watercooler".into()],
+                vec!["name".into(), "Hijacked".into()],
+            ],
+            content: String::new(),
+            created_at: None,
+        },
+        &outsider,
+    )
+    .unwrap();
+    let (ok, msg) = out.publish(&hijack, T).await.unwrap();
+    assert!(!ok);
+    assert!(msg.contains("admins only"), "got: {msg}");
+}
+
+/// Closing the door stops new members without evicting the existing ones.
+#[tokio::test]
+async fn locking_the_relay_stops_invites_but_not_members() {
+    let operator = Keys::generate();
+    let (_handle, st, url) = start_relay("locked", &operator, false).await;
+
+    // Someone who got in before the lock.
+    let member = Keys::generate();
+    st.db.whitelist_add(&member.pk_hex, "test").unwrap();
+
+    st.set_locked(true);
+
+    // A fresh invite is now worthless.
+    let invite = st.db.invite_create(1, None).unwrap();
+    let newcomer = Keys::generate();
+    let mut client = Client::connect(&url, None).await.unwrap();
+    let (ok, msg) = client
+        .redeem_invite(&newcomer, &invite.code, T)
+        .await
+        .unwrap();
+    assert!(!ok, "a locked relay must refuse invites");
+    assert!(msg.contains("not accepting new members"), "got: {msg}");
+    assert!(
+        !st.db.whitelist_contains(&newcomer.pk_hex).unwrap(),
+        "a refused redemption must not whitelist anyone"
+    );
+
+    // …but existing members are unaffected.
+    let mut mem = Client::connect(&url, None).await.unwrap();
+    let (authed, msg) = mem.auth(&member, T).await.unwrap();
+    assert!(authed, "existing members keep their access: {msg}");
+
+    // Reopening restores the previous behaviour.
+    st.set_locked(false);
+    let mut again = Client::connect(&url, None).await.unwrap();
+    let (ok, msg) = again
+        .redeem_invite(&newcomer, &invite.code, T)
+        .await
+        .unwrap();
+    assert!(ok, "reopening lets invites work again: {msg}");
+}
+
 #[tokio::test]
 async fn live_subscription_delivers_messages() {
     let operator = Keys::generate();

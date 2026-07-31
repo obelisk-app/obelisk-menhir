@@ -121,6 +121,21 @@ pub async fn host_invite_create(
 }
 
 #[tauri::command]
+pub async fn host_set_locked(_state: State<'_, NodeState>, locked: bool) -> Result<HostStatus, String> {
+    let _ = locked;
+    Err(UNSUPPORTED.into())
+}
+
+#[tauri::command]
+pub async fn host_invite_revoke(
+    _state: State<'_, NodeState>,
+    code: Option<String>,
+) -> Result<HostStatus, String> {
+    let _ = code;
+    Err(UNSUPPORTED.into())
+}
+
+#[tauri::command]
 pub async fn host_whitelist_add(pubkey: String) -> Result<(), String> {
     let _ = pubkey;
     Err(UNSUPPORTED.into())

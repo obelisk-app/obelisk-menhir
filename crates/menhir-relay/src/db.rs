@@ -397,6 +397,18 @@ impl Db {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
+    /// Delete one invite code. Returns true if it existed.
+    pub fn invite_revoke(&self, code: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute("DELETE FROM invites WHERE code = ?1", params![code])? > 0)
+    }
+
+    /// Delete every invite code, so nothing outstanding can still be redeemed.
+    pub fn invite_revoke_all(&self) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute("DELETE FROM invites", [])?)
+    }
+
     /// Validate + consume one use of an invite code.
     pub fn invite_redeem(&self, code: &str) -> Result<std::result::Result<(), String>> {
         let conn = self.conn.lock().unwrap();

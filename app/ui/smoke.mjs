@@ -98,10 +98,13 @@ check('the session is persisted', () => {
 console.log('\napp wiring:');
 check('every app control is wired', () => {
   const ids = ['add-server-btn', 'add-server-confirm', 'scan-qr-btn', 'server-qr-btn',
-    'me-box', 'profile-save', 'create-channel-btn', 'cc-confirm', 'send-btn',
+    'server-settings-btn', 'server-rename-save', 'server-remove',
+    'me-box', 'profile-save', 'copy-npub', 'reveal-nsec', 'copy-nsec', 'clear-cache',
+    'logout-btn-settings', 'create-channel-btn', 'cc-confirm', 'send-btn',
+    'channel-admin-btn', 'ca-save', 'ca-delete',
     'back-btn', 'logout-btn', 'host-recheck-btn', 'host-start-btn', 'host-stop-btn',
     'host-invite-btn', 'host-invite-qr', 'host-share-qr', 'host-copy-share',
-    'host-open-local', 'host-wl-add', 'qr-copy'];
+    'host-open-local', 'host-wl-add', 'host-revoke-all', 'qr-copy'];
   const missing = ids.filter((id) => !$(id));
   if (missing.length) throw new Error('missing elements: ' + missing.join(', '));
   const unwired = ids.filter((id) => typeof $(id).onclick !== 'function');
@@ -113,16 +116,28 @@ check('every data-close button targets a real modal', () => {
     if (typeof btn.onclick !== 'function') throw new Error(`${btn.dataset.close} close button unwired`);
   }
 });
-check('profile editor opens and shows the npub', () => {
+check('settings opens with identity, storage and version', () => {
   $('me-box').onclick();
-  if ($('profile-modal').classList.contains('hidden')) throw new Error('profile modal did not open');
+  if ($('profile-modal').classList.contains('hidden')) throw new Error('settings did not open');
   if (!$('profile-npub').textContent.startsWith('npub1')) throw new Error('npub missing');
   if ($('profile-signer').textContent === '—') throw new Error('signer kind not described');
+  if ($('cache-size').textContent === '—') throw new Error('cache size not reported');
+  if (!/^\d+\.\d+\.\d+$/.test($('app-version').textContent)) {
+    throw new Error('version not shown: ' + $('app-version').textContent);
+  }
+  if ($('reveal-nsec').classList.contains('hidden')) {
+    throw new Error('nsec signer should offer to reveal the key');
+  }
 });
 check('saving a profile with no connection explains why', () => {
   $('profile-name').value = 'smoke tester';
   $('profile-save').onclick();
   if ($('profile-error').classList.contains('hidden')) throw new Error('no error shown');
+});
+check('the channel admin button stays hidden for non-admins', () => {
+  if (!$('channel-admin-btn').classList.contains('hidden')) {
+    throw new Error('admin controls offered without admin rights');
+  }
 });
 
 console.log('\njoin links:');

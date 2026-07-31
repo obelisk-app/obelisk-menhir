@@ -1,10 +1,13 @@
 // Obelisk Menhir — Nostr text-channel client.
-// Transport: raw NIP-01 websocket. Signing: nsec / NIP-07 / NIP-46 (see signer.js).
-// Under Tauri, hosting and .onion bridging come from Rust commands.
+// Transport: raw NIP-01 websocket. Signing: nsec / NIP-07 / NIP-46 (signer.js).
+// History is cached locally (store.js) so a dropped connection — or a cold Tor
+// circuit — never leaves the user staring at an empty channel.
 
 import * as nip19 from 'nostr-tools/nip19';
 import { NsecSigner, Nip07Signer, RemoteSigner, restoreSigner } from './signer.js';
 import { renderQR, startScanner } from './qr.js';
+import * as store from './store.js';
+import { APP_VERSION } from './version.js';
 
 // ---------- helpers ----------
 
@@ -15,14 +18,28 @@ const setText = (el, t) => { el.textContent = t; };
 
 const NOSTR_CONNECT_RELAYS = ['wss://relay.nsec.app', 'wss://relay.damus.io', 'wss://nos.lol'];
 
+const KIND = {
+  PROFILE: 0,
+  CHAT: 9,
+  PUT_USER: 9000,
+  REMOVE_USER: 9001,
+  EDIT_METADATA: 9002,
+  CREATE_GROUP: 9007,
+  DELETE_GROUP: 9008,
+  AUTH: 22242,
+  INVITE_REDEEM: 20284,
+  META: 39000,
+  ADMINS: 39001,
+  MEMBERS: 39002,
+};
+
 function shortNpub(pkHex) {
   const npub = nip19.npubEncode(pkHex);
   return npub.slice(0, 10) + '…' + npub.slice(-4);
 }
 
-function fmtTime(ts) {
-  return new Date(ts * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-}
+const fmtTime = (ts) =>
+  new Date(ts * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 
 async function copyText(text) {
   try {
@@ -69,7 +86,10 @@ class RelayConn {
       // Tor circuit to the onion behind it — a cold one can take the better
       // part of a minute. Timing out at 20s there just restarts the wait.
       const budget = this.displayUrl.includes('.onion') ? 120000 : 20000;
-      const failTimer = setTimeout(() => { ws.close(); reject(new Error('connection timed out')); }, budget);
+      const failTimer = setTimeout(() => {
+        ws.close();
+        reject(new Error('connection timed out'));
+      }, budget);
       ws.onopen = () => { clearTimeout(failTimer); resolve(); };
       ws.onerror = () => { clearTimeout(failTimer); reject(new Error('could not reach the relay')); };
       ws.onclose = () => { if (!this.dead) { this.dead = true; this.onclose?.(); } };
@@ -95,7 +115,7 @@ class RelayConn {
     if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify(arr));
   }
 
-  waitForOk(eventId, timeoutMs = 15000) {
+  waitForOk(eventId, timeoutMs = 20000) {
     return new Promise((resolve) => {
       const timer = setTimeout(() => {
         this.okWaiters.delete(eventId);
@@ -105,7 +125,7 @@ class RelayConn {
     });
   }
 
-  publish(event, timeoutMs = 15000) {
+  publish(event, timeoutMs = 20000) {
     const waiter = this.waitForOk(event.id, timeoutMs);
     this.send(['EVENT', event]);
     return waiter;
@@ -140,10 +160,20 @@ let channels = new Map();
 let activeChannel = null;
 let msgSubId = null;
 let profiles = new Map();
-let reconnectTimer = null;
 let myProfile = { name: '', about: '' };
 let ncSession = null;
 let stopScanner = null;
+
+/** channelId -> array of events, newest last. Seeded from the local cache. */
+let messages = new Map();
+/** channelId -> Set(pubkey) of admins, from the relay-signed 39001. */
+let channelAdmins = new Map();
+/** channelId -> [{pubkey, role}], from 39002 + 39001. */
+let channelMembers = new Map();
+
+let reconnectTimer = null;
+let reconnectAttempt = 0;
+let countdownTimer = null;
 
 const saveServers = () => localStorage.setItem('menhir-servers', JSON.stringify(servers));
 
@@ -153,7 +183,7 @@ function persistSigner() {
   else localStorage.removeItem('menhir-signer');
 }
 
-// ---------- connection flow ----------
+// ---------- connection ----------
 
 async function resolveWsUrl(url) {
   if (!url.includes('.onion')) return url;
@@ -163,7 +193,7 @@ async function resolveWsUrl(url) {
   // The Rust side bridges onion → loopback: a managed Tor on desktop, an
   // embedded arti on mobile. Either way the first connect builds a circuit,
   // which is slow enough to be worth saying out loud.
-  setServerStatus('connecting through Tor…');
+  setServerStatus('connecting through Tor — the first time takes a minute…');
   return await tauriInvoke('bridge_open', { onionUrl: url });
 }
 
@@ -180,28 +210,65 @@ function setServerStatus(text, isError) {
   el.style.color = isError ? 'var(--lc-red)' : '';
 }
 
-async function selectServer(entry) {
+/** Back off after repeated failures instead of hammering a server that is down. */
+function scheduleReconnect(entry) {
   clearTimeout(reconnectTimer);
+  clearInterval(countdownTimer);
+  reconnectAttempt += 1;
+  const base = Math.min(30000, 1500 * 2 ** (reconnectAttempt - 1));
+  const delay = Math.round(base * (0.75 + Math.random() * 0.5)); // jitter
+  let left = Math.ceil(delay / 1000);
+  const tick = () => {
+    setServerStatus(`offline — reconnecting in ${left}s`, true);
+    left -= 1;
+  };
+  tick();
+  countdownTimer = setInterval(tick, 1000);
+  reconnectTimer = setTimeout(() => {
+    clearInterval(countdownTimer);
+    if (activeServer === entry) connectTo(entry, true);
+  }, delay);
+}
+
+/**
+ * Connect (or reconnect) to a server.
+ *
+ * On a reconnect the UI is deliberately left alone: channels and messages stay
+ * on screen from the cache, and subscriptions resume from the newest event we
+ * already hold rather than refetching everything.
+ */
+async function connectTo(entry, isReconnect = false) {
+  clearTimeout(reconnectTimer);
+  clearInterval(countdownTimer);
   conn?.destroy();
   conn = null;
-  activeServer = entry;
-  channels = new Map();
-  activeChannel = null;
-  msgSubId = null;
-  renderRail();
-  renderChannels();
-  clearChat('Connecting…');
-  setText($('server-name'), entry.label || entry.url);
-  show($('server-qr-btn'));
-  setServerStatus('connecting…');
-  if (isMobile()) showPane('channels');
+
+  if (!isReconnect) {
+    reconnectAttempt = 0;
+    // Paint from cache first so there is something to look at immediately.
+    channels = new Map(store.loadChannels(entry.url).map((c) => [c.id, c]));
+    profiles = new Map(Object.entries(store.loadProfiles(entry.url)));
+    messages = new Map();
+    channelAdmins = new Map();
+    channelMembers = new Map();
+    activeChannel = null;
+    msgSubId = null;
+    renderRail();
+    renderChannels();
+    setText($('server-name'), entry.label || entry.url);
+    show($('server-qr-btn'));
+    show($('server-settings-btn'));
+    clearChat(channels.size ? 'Pick a channel.' : 'Connecting…');
+    if (isMobile()) showPane('channels');
+  }
+  setServerStatus(isReconnect ? 'reconnecting…' : 'connecting…');
 
   let wsUrl;
   try {
     wsUrl = await resolveWsUrl(entry.url);
   } catch (e) {
     setServerStatus(String(e.message || e), true);
-    clearChat(String(e.message || e));
+    scheduleReconnect(entry);
     return;
   }
 
@@ -213,8 +280,11 @@ async function selectServer(entry) {
   const onReady = () => {
     if (ready || conn !== c) return;
     ready = true;
+    reconnectAttempt = 0;
     setServerStatus(isUnprotectedCleartext(entry.url) ? 'online — unencrypted (ws://)' : 'online');
     openMetaSubscriptions(c);
+    if (activeChannel) subscribeChannel(activeChannel);
+    maybeAdoptRelayName(entry, wsUrl);
   };
 
   c.onauthchallenge = async (challenge) => {
@@ -223,10 +293,10 @@ async function selectServer(entry) {
     try {
       setServerStatus('authenticating…');
       // The relay tag must name the endpoint actually dialled: the relay
-      // compares it against the connection's Host header to stop a signed
-      // auth event being replayed against a different relay.
+      // compares it against the connection's Host header so a signed auth
+      // event cannot be replayed against a different relay.
       const authEvent = await signer.sign({
-        kind: 22242,
+        kind: KIND.AUTH,
         tags: [['relay', wsUrl], ['challenge', challenge]],
         content: '',
       });
@@ -237,7 +307,11 @@ async function selectServer(entry) {
 
       if (entry.invite) {
         setServerStatus('redeeming invite…');
-        const redeem = await signer.sign({ kind: 20284, tags: [], content: entry.invite });
+        const redeem = await signer.sign({
+          kind: KIND.INVITE_REDEEM,
+          tags: [],
+          content: entry.invite,
+        });
         const r = await c.publish(redeem);
         if (r.ok) {
           entry.invite = null; // consumed — the whitelisting persists on the relay
@@ -257,8 +331,7 @@ async function selectServer(entry) {
 
   c.onclose = () => {
     if (conn !== c) return;
-    setServerStatus('disconnected — retrying', true);
-    reconnectTimer = setTimeout(() => { if (activeServer === entry) selectServer(entry); }, 4000);
+    scheduleReconnect(entry);
   };
 
   try {
@@ -266,8 +339,7 @@ async function selectServer(entry) {
   } catch (e) {
     if (conn === c) {
       setServerStatus('unreachable: ' + (e.message || e), true);
-      clearChat('Could not reach this server. Is the host online?');
-      reconnectTimer = setTimeout(() => { if (activeServer === entry) selectServer(entry); }, 6000);
+      scheduleReconnect(entry);
     }
     return;
   }
@@ -275,8 +347,39 @@ async function selectServer(entry) {
   graceTimer = setTimeout(onReady, 1500);
 }
 
+const selectServer = (entry) => {
+  activeServer = entry;
+  connectTo(entry, false);
+};
+
+/**
+ * Ask the relay what it calls itself (NIP-11) and adopt that name, unless the
+ * user has set their own. Best-effort: a relay that does not answer just keeps
+ * whatever label it already had.
+ */
+async function maybeAdoptRelayName(entry, wsUrl) {
+  if (entry.custom) return;
+  try {
+    const httpUrl = wsUrl.replace(/^ws:/, 'http:').replace(/^wss:/, 'https:');
+    const res = await fetch(httpUrl, {
+      headers: { Accept: 'application/nostr+json' },
+      signal: AbortSignal.timeout(15000),
+    });
+    const info = await res.json();
+    const name = (info?.name || '').trim();
+    if (name && name !== entry.label) {
+      entry.label = name.slice(0, 40);
+      saveServers();
+      renderRail();
+      if (activeServer === entry) setText($('server-name'), entry.label);
+    }
+  } catch {
+    // NIP-11 is a nicety, not a requirement.
+  }
+}
+
 function openMetaSubscriptions(c) {
-  c.req([{ kinds: [39000], limit: 500 }], {
+  c.req([{ kinds: [KIND.META], limit: 500 }], {
     onevent: (ev) => {
       const id = ev.tags.find((t) => t[0] === 'd')?.[1];
       if (!id) return;
@@ -288,9 +391,10 @@ function openMetaSubscriptions(c) {
       renderChannels();
     },
     oneose: () => {
+      store.saveChannels(activeServer.url, [...channels.values()]);
       renderChannels();
       if (channels.size === 0) {
-        clearChat('No channels here yet.' + (conn ? '\n\nCreate the first one with “+ new channel”.' : ''));
+        clearChat('No channels here yet.\n\nCreate the first one with “+ new channel”.');
       } else if (!activeChannel && !isMobile()) {
         selectChannel([...channels.keys()][0]);
       } else if (!activeChannel) {
@@ -298,55 +402,95 @@ function openMetaSubscriptions(c) {
       }
     },
   });
-  c.req([{ kinds: [0], limit: 500 }], {
+
+  // Who may administer what — drives the channel settings button.
+  c.req([{ kinds: [KIND.ADMINS, KIND.MEMBERS], limit: 500 }], {
+    onevent: (ev) => {
+      const id = ev.tags.find((t) => t[0] === 'd')?.[1];
+      if (!id) return;
+      const people = ev.tags.filter((t) => t[0] === 'p');
+      if (ev.kind === KIND.ADMINS) {
+        channelAdmins.set(id, new Set(people.map((t) => t[1])));
+      } else {
+        channelMembers.set(id, people.map((t) => ({ pubkey: t[1], role: t[2] || 'member' })));
+      }
+      if (id === activeChannel) refreshAdminAffordance();
+    },
+  });
+
+  c.req([{ kinds: [KIND.PROFILE], limit: 500 }], {
     onevent: (ev) => {
       try {
         const meta = JSON.parse(ev.content);
         const name = meta.display_name || meta.name;
-        if (name) {
-          profiles.set(ev.pubkey, name);
-          if (ev.pubkey === signer.pubkey) {
-            myProfile = { name, about: meta.about || '' };
-            setText($('me-name'), name);
-          }
-          renderMessageAuthors();
+        if (!name) return;
+        profiles.set(ev.pubkey, name);
+        if (ev.pubkey === signer.pubkey) {
+          myProfile = { name, about: meta.about || '' };
+          setText($('me-name'), name);
         }
+        renderMessageAuthors();
       } catch {}
     },
+    oneose: () => store.saveProfiles(activeServer.url, Object.fromEntries(profiles)),
   });
 }
 
 // ---------- channels & messages ----------
 
+function isAdminOf(channelId) {
+  return !!signer && !!channelAdmins.get(channelId)?.has(signer.pubkey);
+}
+
+function refreshAdminAffordance() {
+  $('channel-admin-btn').classList.toggle('hidden', !activeChannel || !isAdminOf(activeChannel));
+}
+
 function selectChannel(id) {
-  if (!conn) return;
-  if (msgSubId) conn.closeSub(msgSubId);
   activeChannel = id;
   renderChannels();
   setText($('chat-title'), '#' + (channels.get(id)?.name || id));
-  clearChat();
   show($('composer'));
+  refreshAdminAffordance();
   if (isMobile()) showPane('chat');
 
-  const seen = new Set();
-  let eosed = false;
-  const buffer = [];
-  msgSubId = conn.req([{ kinds: [9], '#h': [id], limit: 100 }], {
-    onevent: (ev) => {
-      if (seen.has(ev.id)) return;
-      seen.add(ev.id);
-      if (!eosed) buffer.push(ev);
-      else appendMessage(ev, true);
-    },
+  // Cache first: the channel is readable before the relay says anything.
+  if (!messages.has(id)) messages.set(id, store.loadMessages(activeServer.url, id));
+  renderMessages(id);
+
+  if (conn) subscribeChannel(id);
+}
+
+/** (Re)subscribe to a channel, resuming from the newest event already held. */
+function subscribeChannel(id) {
+  if (msgSubId) conn.closeSub(msgSubId);
+  const cached = messages.get(id) || [];
+  const since = store.resumeSince(cached);
+  const filter = { kinds: [KIND.CHAT], '#h': [id], limit: 200 };
+  if (since !== undefined) filter.since = since;
+
+  let batch = [];
+  msgSubId = conn.req([filter], {
+    onevent: (ev) => batch.push(ev),
     oneose: () => {
-      eosed = true;
-      buffer.sort((a, b) => a.created_at - b.created_at);
-      if (buffer.length === 0) clearChat('No messages yet — say something.');
-      else for (const ev of buffer) appendMessage(ev, false);
-      scrollChat();
+      ingest(id, batch);
+      batch = [];
+      // Everything after EOSE is live: render as it lands.
+      conn.subs.get(msgSubId).onevent = (ev) => ingest(id, [ev]);
     },
     onclosed: (msg) => setServerStatus('subscription closed: ' + msg, true),
   });
+}
+
+/** Merge events into a channel, persist, and repaint if it is on screen. */
+function ingest(channelId, incoming) {
+  if (!incoming.length) return;
+  const before = messages.get(channelId) || [];
+  const merged = store.mergeMessages(before, incoming);
+  if (merged.length === before.length) return; // nothing new
+  messages.set(channelId, merged);
+  store.saveMessages(activeServer.url, channelId, merged);
+  if (channelId === activeChannel) renderMessages(channelId);
 }
 
 function clearChat(placeholder) {
@@ -360,11 +504,23 @@ function clearChat(placeholder) {
   }
 }
 
-function appendMessage(ev, scroll) {
+function renderMessages(channelId) {
   const box = $('messages');
-  const placeholder = box.querySelector('.msg.system');
-  if (placeholder) placeholder.remove();
+  const list = messages.get(channelId) || [];
+  // Only auto-scroll when already near the bottom, so reading history is not
+  // yanked away every time a message arrives.
+  const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 120;
 
+  box.innerHTML = '';
+  if (!list.length) {
+    clearChat('No messages yet — say something.');
+    return;
+  }
+  for (const ev of list) box.appendChild(renderMessage(ev));
+  if (nearBottom) box.scrollTop = box.scrollHeight;
+}
+
+function renderMessage(ev) {
   const div = document.createElement('div');
   div.className = 'msg' + (ev.pubkey === signer?.pubkey ? ' mine' : '');
   div.dataset.pubkey = ev.pubkey;
@@ -384,8 +540,7 @@ function appendMessage(ev, scroll) {
   body.textContent = ev.content; // plain text only — never innerHTML
 
   div.append(head, body);
-  box.appendChild(div);
-  if (scroll) scrollChat();
+  return div;
 }
 
 function renderMessageAuthors() {
@@ -395,24 +550,26 @@ function renderMessageAuthors() {
   }
 }
 
-function scrollChat() {
-  const box = $('messages');
-  box.scrollTop = box.scrollHeight;
-}
-
 async function sendMessage() {
   const input = $('composer-input');
   const text = input.value.trim();
-  if (!text || !conn || !activeChannel) return;
+  if (!text || !activeChannel) return;
+  if (!conn || conn.dead) {
+    setServerStatus('not connected — message kept in the box', true);
+    return;
+  }
   input.value = '';
   input.style.height = 'auto';
   try {
-    const ev = await signer.sign({ kind: 9, tags: [['h', activeChannel]], content: text });
+    const ev = await signer.sign({ kind: KIND.CHAT, tags: [['h', activeChannel]], content: text });
     const { ok, msg } = await conn.publish(ev);
     if (!ok) {
       setServerStatus('send failed: ' + msg, true);
       input.value = text;
+      return;
     }
+    // Show it immediately rather than waiting for the echo.
+    ingest(activeChannel, [ev]);
   } catch (e) {
     setServerStatus('could not sign: ' + (e.message || e), true);
     input.value = text;
@@ -431,29 +588,7 @@ function renderRail() {
     btn.textContent = label[0].toUpperCase();
     btn.title = `${label}\n${entry.url}`;
     btn.onclick = () => selectServer(entry);
-    btn.oncontextmenu = (e) => {
-      e.preventDefault();
-      const name = prompt('Name this server (Cancel to remove it)', entry.label || '');
-      if (name === null) {
-        if (!confirm(`Remove ${label}?`)) return;
-        servers = servers.filter((s) => s !== entry);
-        saveServers();
-        if (activeServer === entry) {
-          conn?.destroy();
-          conn = null;
-          activeServer = null;
-          channels = new Map();
-          renderChannels();
-          clearChat('Pick a server, or add one with +.');
-          hide($('server-qr-btn'));
-        }
-      } else if (name.trim()) {
-        entry.label = name.trim();
-        saveServers();
-        if (activeServer === entry) setText($('server-name'), entry.label);
-      }
-      renderRail();
-    };
+    btn.oncontextmenu = (e) => { e.preventDefault(); openServerSettings(entry); };
     list.appendChild(btn);
   }
 }
@@ -469,17 +604,14 @@ function renderChannels() {
     div.onclick = () => selectChannel(ch.id);
     list.appendChild(div);
   }
+  // Anyone the server admits may open a channel — not just the operator.
   $('create-channel-btn').classList.toggle('hidden', !conn);
 }
 
 // ---------- mobile panes ----------
 
 const isMobile = () => window.matchMedia('(max-width: 760px)').matches;
-
-/** 'channels' or 'chat' — only meaningful on phones. */
-function showPane(which) {
-  document.body.classList.toggle('show-chat', which === 'chat');
-}
+const showPane = (which) => document.body.classList.toggle('show-chat', which === 'chat');
 
 // ---------- servers ----------
 
@@ -495,25 +627,104 @@ function parseServerInput(raw) {
   throw new Error('paste a ws:// or wss:// URL, or an obelisk://join link');
 }
 
-function addServer(url, invite) {
+function defaultLabel(url) {
+  const host = url.replace(/^wss?:\/\//, '').split('/')[0].split(':')[0];
+  // An onion address makes a meaningless label; say so rather than showing
+  // sixteen random characters, until the relay tells us its real name.
+  if (host.endsWith('.onion')) return 'Onion server';
+  return host.length > 18 ? host.slice(0, 16) + '…' : host;
+}
+
+function addServer(url, invite, name) {
   let entry = servers.find((s) => s.url === url);
   if (!entry) {
-    const host = url.replace(/^wss?:\/\//, '').split('/')[0].split(':')[0];
-    entry = { url, label: host.length > 18 ? host.slice(0, 10) + '…' : host, invite };
+    entry = {
+      url,
+      label: (name || '').trim() || defaultLabel(url),
+      invite,
+      custom: !!(name || '').trim(),
+    };
     servers.push(entry);
     saveServers();
-  } else if (invite) {
-    entry.invite = invite;
+  } else {
+    if (invite) entry.invite = invite;
+    if ((name || '').trim()) {
+      entry.label = name.trim();
+      entry.custom = true;
+    }
     saveServers();
   }
   renderRail();
   selectServer(entry);
 }
 
+function openServerSettings(entry) {
+  const target = entry || activeServer;
+  if (!target) return;
+  hide($('server-settings-error'));
+  $('server-rename').value = target.custom ? target.label : '';
+  $('server-rename').placeholder = target.label || 'Server name';
+  setText($('server-address'), target.url);
+  $('server-settings-modal').dataset.url = target.url;
+  show($('server-settings-modal'));
+  $('server-rename').focus();
+}
+
+function saveServerName() {
+  const url = $('server-settings-modal').dataset.url;
+  const entry = servers.find((s) => s.url === url);
+  if (!entry) return;
+  const name = $('server-rename').value.trim();
+  if (name) {
+    entry.label = name.slice(0, 40);
+    entry.custom = true;
+  } else {
+    // Cleared: fall back to whatever the relay calls itself.
+    entry.custom = false;
+    entry.label = defaultLabel(entry.url);
+    if (conn && activeServer === entry) maybeAdoptRelayName(entry, conn.wsUrl);
+  }
+  saveServers();
+  renderRail();
+  if (activeServer === entry) setText($('server-name'), entry.label);
+  hide($('server-settings-modal'));
+}
+
+function removeServer() {
+  const url = $('server-settings-modal').dataset.url;
+  const entry = servers.find((s) => s.url === url);
+  if (!entry) return;
+  if (!confirm(`Remove ${entry.label}? Cached messages for it are deleted too.`)) return;
+  servers = servers.filter((s) => s !== entry);
+  saveServers();
+  store.forgetServer(entry.url);
+  hide($('server-settings-modal'));
+  if (activeServer === entry) {
+    clearTimeout(reconnectTimer);
+    clearInterval(countdownTimer);
+    conn?.destroy();
+    conn = null;
+    activeServer = null;
+    channels = new Map();
+    messages = new Map();
+    activeChannel = null;
+    renderChannels();
+    clearChat('Pick a server, or add one with +.');
+    setText($('server-name'), '—');
+    setServerStatus('not connected');
+    hide($('server-qr-btn'));
+    hide($('server-settings-btn'));
+  }
+  renderRail();
+}
+
+// ---------- QR ----------
+
 let currentQrText = '';
 
 async function showQR(title, text) {
   currentQrText = text;
+  hide($('qr-note'));
   setText($('qr-title'), title);
   setText($('qr-text'), text);
   show($('qr-modal'));
@@ -522,6 +733,45 @@ async function showQR(title, text) {
   } catch (e) {
     setText($('qr-text'), 'Could not render a QR: ' + (e.message || e));
   }
+}
+
+const isLoopback = (url) =>
+  /^wss?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:|\/|$)/.test(url);
+
+/**
+ * Share the active server as a QR.
+ *
+ * A loopback address is meaningless to anyone else, so when this is our own
+ * hosted relay we substitute the onion address it is published under. If there
+ * is no onion, say plainly that the link goes nowhere rather than handing over
+ * a QR for 127.0.0.1.
+ */
+async function shareActiveServer() {
+  if (!activeServer) return;
+  let url = activeServer.url;
+
+  if (isLoopback(url) && tauriInvoke) {
+    try {
+      const st = await tauriInvoke('host_status');
+      if (st.onion) url = 'ws://' + st.onion;
+    } catch {}
+  }
+
+  if (isLoopback(url)) {
+    setText($('qr-title'), 'This server is local only');
+    setText($('qr-text'), url);
+    show($('qr-modal'));
+    currentQrText = url;
+    setText(
+      $('qr-note'),
+      'This address only works on this computer, so a QR of it is no use to anyone else. Start hosting with Tor to get a shareable onion address.',
+    );
+    show($('qr-note'));
+    try { await renderQR($('share-qr'), url, 240); } catch {}
+    return;
+  }
+  hide($('qr-note'));
+  await showQR('Share this server', `obelisk://join?relay=${url}`);
 }
 
 async function openScanner() {
@@ -538,7 +788,8 @@ async function openScanner() {
         try {
           const { url, invite } = parseServerInput(text);
           hide($('add-server-modal'));
-          addServer(url, invite);
+          addServer(url, invite, $('add-server-name').value);
+          $('add-server-name').value = '';
         } catch (e) {
           $('add-server-input').value = text;
           setText($('add-server-error'), String(e.message || e));
@@ -562,6 +813,86 @@ function closeScanner() {
   hide($('scan-modal'));
 }
 
+// ---------- channel administration ----------
+
+function openChannelAdmin() {
+  if (!activeChannel || !isAdminOf(activeChannel)) return;
+  const ch = channels.get(activeChannel);
+  hide($('ca-error'));
+  $('ca-name').value = ch?.name || '';
+  $('ca-about').value = ch?.about || '';
+  renderChannelMembers();
+  show($('channel-admin-modal'));
+}
+
+function renderChannelMembers() {
+  const box = $('ca-members');
+  box.innerHTML = '';
+  const list = channelMembers.get(activeChannel) || [];
+  if (!list.length) {
+    const p = document.createElement('p');
+    p.className = 'muted small';
+    p.textContent = 'No members listed yet.';
+    box.appendChild(p);
+    return;
+  }
+  const admins = channelAdmins.get(activeChannel) || new Set();
+  for (const m of list) {
+    const row = document.createElement('div');
+    row.className = 'wl-item';
+
+    const who = document.createElement('code');
+    const name = profiles.get(m.pubkey);
+    who.textContent = (name ? name + ' · ' : '') + shortNpub(m.pubkey) + (admins.has(m.pubkey) ? ' · admin' : '');
+    who.title = nip19.npubEncode(m.pubkey);
+
+    const actions = document.createElement('div');
+    actions.className = 'row gap';
+    if (m.pubkey !== signer.pubkey) {
+      const promote = document.createElement('button');
+      promote.textContent = admins.has(m.pubkey) ? 'demote' : 'make admin';
+      promote.className = 'link-btn';
+      promote.onclick = () => setRole(m.pubkey, admins.has(m.pubkey) ? 'member' : 'admin');
+      const kick = document.createElement('button');
+      kick.textContent = 'remove';
+      kick.onclick = () => removeMember(m.pubkey);
+      actions.append(promote, kick);
+    }
+    row.append(who, actions);
+    box.appendChild(row);
+  }
+}
+
+async function adminPublish(kind, tags, errEl = 'ca-error') {
+  try {
+    const ev = await signer.sign({ kind, tags, content: '' });
+    const { ok, msg } = await conn.publish(ev);
+    if (!ok) throw new Error(msg);
+    return true;
+  } catch (e) {
+    setText($(errEl), String(e.message || e));
+    show($(errEl));
+    return false;
+  }
+}
+
+async function setRole(pubkey, role) {
+  const ok = await adminPublish(KIND.PUT_USER, [
+    ['h', activeChannel],
+    ['p', pubkey, role],
+  ]);
+  if (ok) setTimeout(renderChannelMembers, 400);
+}
+
+async function removeMember(pubkey) {
+  if (!confirm('Remove this member from the channel?')) return;
+  const ok = await adminPublish(KIND.REMOVE_USER, [
+    ['h', activeChannel],
+    ['p', pubkey],
+  ]);
+  if (ok) setTimeout(renderChannelMembers, 400);
+}
+
 // ---------- hosting (desktop only) ----------
 
 let hostPollTimer = null;
@@ -582,6 +913,31 @@ async function refreshHostPanel() {
       setText($('host-state'), st.tor_state);
       setText($('host-onion'), st.onion ? 'ws://' + st.onion : '(no Tor — local only)');
       setText($('host-share'), st.share_link || st.relay_url || '—');
+
+      $('host-locked').checked = !!st.locked;
+      setText(
+        $('host-locked-label'),
+        st.locked ? 'Closed — nobody new can join' : 'Open — invite codes work',
+      );
+
+      const invites = $('host-invite-list');
+      invites.innerHTML = '';
+      for (const inv of st.invites || []) {
+        const row = document.createElement('div');
+        row.className = 'wl-item';
+        const code = document.createElement('code');
+        code.textContent = `${inv.code}  ${inv.uses}/${inv.max_uses}`;
+        const revoke = document.createElement('button');
+        revoke.textContent = 'revoke';
+        revoke.onclick = async () => {
+          try { await tauriInvoke('host_invite_revoke', { code: inv.code }); refreshHostPanel(); }
+          catch (e) { hostError(e); }
+        };
+        row.append(code, revoke);
+        invites.appendChild(row);
+      }
+      $('host-revoke-all').classList.toggle('hidden', !(st.invites || []).length);
+
       const wl = $('host-wl-list');
       wl.innerHTML = '';
       for (const npub of st.whitelist) {
@@ -614,6 +970,77 @@ function hostError(e) {
   el.classList.toggle('hidden', !e);
 }
 
+// ---------- settings ----------
+
+function approximateCacheSize() {
+  let bytes = 0;
+  for (let i = 0; i < localStorage.length; i++) {
+    const k = localStorage.key(i);
+    if (k?.startsWith('menhir-cache/')) bytes += k.length + (localStorage.getItem(k)?.length || 0);
+  }
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function openSettings() {
+  hide($('profile-error'));
+  hide($('nsec-box'));
+  hide($('profile-saved'));
+  $('profile-name').value = myProfile.name || '';
+  $('profile-about').value = myProfile.about || '';
+  setText($('profile-npub'), nip19.npubEncode(signer.pubkey));
+  setText($('profile-signer'), {
+    nsec: 'a secret key on this device',
+    nip07: 'a browser extension',
+    bunker: 'a remote signer (NIP-46)',
+  }[signer.kind] || signer.kind);
+  $('reveal-nsec').classList.toggle('hidden', signer.kind !== 'nsec');
+  setText($('cache-size'), approximateCacheSize());
+  setText($('app-version'), APP_VERSION);
+  show($('profile-modal'));
+}
+
+async function saveProfile() {
+  const name = $('profile-name').value.trim();
+  const about = $('profile-about').value.trim();
+  hide($('profile-saved'));
+  if (!name) {
+    setText($('profile-error'), 'pick a display name');
+    show($('profile-error'));
+    return;
+  }
+  if (!conn) {
+    setText($('profile-error'), 'connect to a server first — your profile is published to it');
+    show($('profile-error'));
+    return;
+  }
+  try {
+    const content = JSON.stringify(
+      about ? { name, display_name: name, about } : { name, display_name: name },
+    );
+    const ev = await signer.sign({ kind: KIND.PROFILE, tags: [], content });
+    const { ok, msg } = await conn.publish(ev);
+    if (!ok) throw new Error(msg);
+    myProfile = { name, about };
+    profiles.set(signer.pubkey, name);
+    store.saveProfiles(activeServer.url, Object.fromEntries(profiles));
+    setText($('me-name'), name);
+    renderMessageAuthors();
+    hide($('profile-error'));
+    show($('profile-saved'));
+  } catch (e) {
+    setText($('profile-error'), String(e.message || e));
+    show($('profile-error'));
+  }
+}
+
+function logOut() {
+  if (!confirm('Log out? If you signed in with a secret key, make sure it is backed up — it is removed from this device.')) return;
+  localStorage.removeItem('menhir-signer');
+  location.reload();
+}
+
 // ---------- login ----------
 
 function loginError(e) {
@@ -622,9 +1049,7 @@ function loginError(e) {
   el.classList.toggle('hidden', !e);
 }
 
-function loginBusy(on) {
-  $('login-busy').classList.toggle('hidden', !on);
-}
+const loginBusy = (on) => $('login-busy').classList.toggle('hidden', !on);
 
 function showLoginPane(name) {
   loginError(null);
@@ -732,11 +1157,8 @@ function wireLogin() {
 }
 
 function wireApp() {
-  $('logout-btn').onclick = () => {
-    if (!confirm('Log out? If you logged in with a secret key, make sure it is backed up — it is removed from this device.')) return;
-    localStorage.removeItem('menhir-signer');
-    location.reload();
-  };
+  $('logout-btn').onclick = logOut;
+  $('logout-btn-settings').onclick = logOut;
 
   for (const btn of document.querySelectorAll('[data-close]')) {
     btn.onclick = () => {
@@ -756,8 +1178,10 @@ function wireApp() {
     try {
       const { url, invite } = parseServerInput($('add-server-input').value);
       hide($('add-server-modal'));
+      const name = $('add-server-name').value;
       $('add-server-input').value = '';
-      addServer(url, invite);
+      $('add-server-name').value = '';
+      addServer(url, invite, name);
     } catch (e) {
       setText($('add-server-error'), String(e.message || e));
       show($('add-server-error'));
@@ -765,51 +1189,34 @@ function wireApp() {
   };
   $('scan-qr-btn').onclick = openScanner;
   $('qr-copy').onclick = async () => { await copyText(currentQrText); flash($('qr-copy')); };
-  $('server-qr-btn').onclick = () => {
-    if (activeServer) showQR('Share this server', `obelisk://join?relay=${activeServer.url}`);
-  };
+  $('server-qr-btn').onclick = () => shareActiveServer();
+  $('server-settings-btn').onclick = () => openServerSettings(activeServer);
+  $('server-rename-save').onclick = saveServerName;
+  $('server-remove').onclick = removeServer;
 
-  // profile
-  $('me-box').onclick = () => {
-    hide($('profile-error'));
-    $('profile-name').value = myProfile.name || '';
-    $('profile-about').value = myProfile.about || '';
-    setText($('profile-npub'), nip19.npubEncode(signer.pubkey));
-    setText($('profile-signer'), {
-      nsec: 'a secret key on this device',
-      nip07: 'a browser extension',
-      bunker: 'a remote signer (NIP-46)',
-    }[signer.kind] || signer.kind);
-    show($('profile-modal'));
-    $('profile-name').focus();
+  // settings
+  $('me-box').onclick = openSettings;
+  $('profile-save').onclick = saveProfile;
+  $('copy-npub').onclick = async () => {
+    await copyText(nip19.npubEncode(signer.pubkey));
+    flash($('copy-npub'));
   };
-  $('profile-save').onclick = async () => {
-    const name = $('profile-name').value.trim();
-    const about = $('profile-about').value.trim();
-    if (!name) {
-      setText($('profile-error'), 'pick a display name');
-      show($('profile-error'));
-      return;
-    }
-    if (!conn) {
-      setText($('profile-error'), 'connect to a server first — your profile is published to it');
-      show($('profile-error'));
-      return;
-    }
-    try {
-      const content = JSON.stringify(about ? { name, display_name: name, about } : { name, display_name: name });
-      const ev = await signer.sign({ kind: 0, tags: [], content });
-      const { ok, msg } = await conn.publish(ev);
-      if (!ok) throw new Error(msg);
-      myProfile = { name, about };
-      profiles.set(signer.pubkey, name);
-      setText($('me-name'), name);
-      renderMessageAuthors();
-      hide($('profile-modal'));
-    } catch (e) {
-      setText($('profile-error'), String(e.message || e));
-      show($('profile-error'));
-    }
+  $('reveal-nsec').onclick = () => {
+    if (signer.kind !== 'nsec') return;
+    if (!confirm('Show your secret key on screen?')) return;
+    setText($('nsec-value'), signer.nsec());
+    show($('nsec-box'));
+  };
+  $('copy-nsec').onclick = async () => {
+    await copyText($('nsec-value').textContent);
+    flash($('copy-nsec'));
+  };
+  $('clear-cache').onclick = () => {
+    if (!confirm('Delete cached messages on this device? They will be re-fetched from each server.')) return;
+    for (const s of servers) store.forgetServer(s.url);
+    messages = new Map();
+    setText($('cache-size'), approximateCacheSize());
+    if (activeChannel) renderMessages(activeChannel);
   };
 
   // channels
@@ -828,16 +1235,32 @@ function wireApp() {
     const tags = [['h', id]];
     if ($('cc-name').value.trim()) tags.push(['name', $('cc-name').value.trim()]);
     if ($('cc-about').value.trim()) tags.push(['about', $('cc-about').value.trim()]);
-    try {
-      const ev = await signer.sign({ kind: 9007, tags, content: '' });
-      const { ok, msg } = await conn.publish(ev);
-      if (!ok) throw new Error(msg);
+    if (await adminPublish(KIND.CREATE_GROUP, tags, 'cc-error')) {
       hide($('create-channel-modal'));
       $('cc-id').value = $('cc-name').value = $('cc-about').value = '';
-      setTimeout(() => selectChannel(id), 300);
-    } catch (e) {
-      setText($('cc-error'), String(e.message || e));
-      show($('cc-error'));
+      setTimeout(() => selectChannel(id), 400);
+    }
+  };
+
+  // channel administration
+  $('channel-admin-btn').onclick = openChannelAdmin;
+  $('ca-save').onclick = async () => {
+    const tags = [['h', activeChannel], ['name', $('ca-name').value.trim() || activeChannel]];
+    if ($('ca-about').value.trim()) tags.push(['about', $('ca-about').value.trim()]);
+    if (await adminPublish(KIND.EDIT_METADATA, tags)) hide($('channel-admin-modal'));
+  };
+  $('ca-delete').onclick = async () => {
+    if (!confirm(`Delete #${activeChannel}? Its messages are erased and the id can never be reused on this server.`)) return;
+    if (await adminPublish(KIND.DELETE_GROUP, [['h', activeChannel]])) {
+      channels.delete(activeChannel);
+      messages.delete(activeChannel);
+      store.saveChannels(activeServer.url, [...channels.values()]);
+      hide($('channel-admin-modal'));
+      activeChannel = null;
+      renderChannels();
+      clearChat('Channel deleted.');
+      hide($('composer'));
+      refreshAdminAffordance();
     }
   };
 
@@ -910,9 +1333,18 @@ function wireApp() {
       if (url) {
         clearInterval(hostPollTimer);
         hide($('host-modal'));
-        addServer(url, null);
+        addServer(url, null, $('host-name').value.trim());
       }
     } catch (e) { hostError(e); }
+  };
+  $('host-locked').onchange = async (e) => {
+    try { await tauriInvoke('host_set_locked', { locked: e.target.checked }); await refreshHostPanel(); }
+    catch (err) { hostError(err); refreshHostPanel(); }
+  };
+  $('host-revoke-all').onclick = async () => {
+    if (!confirm('Revoke every outstanding invite? Links already sent will stop working.')) return;
+    try { await tauriInvoke('host_invite_revoke', { code: null }); await refreshHostPanel(); }
+    catch (e) { hostError(e); }
   };
   $('host-wl-add').onclick = async () => {
     try {
@@ -921,6 +1353,36 @@ function wireApp() {
       refreshHostPanel();
     } catch (e) { hostError(e); }
   };
+
+  trackKeyboard();
+
+  // Mobile browsers kill pages without warning; flush pending cache writes.
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') store.flushWrites();
+  });
+}
+
+/**
+ * Keep the app the size of the *visible* viewport.
+ *
+ * An Android WebView shifts the whole page up when the keyboard opens, which
+ * drags the server rail and header off screen and leaves the composer floating
+ * mid-screen. Sizing to visualViewport instead means the layout shrinks: the
+ * header stays put, the message list gets shorter, and the composer sits
+ * directly above the keyboard.
+ */
+function trackKeyboard() {
+  const vv = window.visualViewport;
+  if (!vv) return;
+  const apply = () => {
+    document.documentElement.style.setProperty('--app-h', `${Math.round(vv.height)}px`);
+    // Opening the keyboard should not hide the message you are replying to.
+    const box = $('messages');
+    if (box) box.scrollTop = box.scrollHeight;
+  };
+  vv.addEventListener('resize', apply);
+  vv.addEventListener('scroll', apply);
+  apply();
 }
 
 async function boot() {

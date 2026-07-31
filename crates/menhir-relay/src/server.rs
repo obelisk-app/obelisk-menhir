@@ -32,6 +32,21 @@ pub struct RelayState {
     pub db: Db,
     pub keys: Keys,
     pub broadcast: broadcast::Sender<Event>,
+    /// Live "no new members" switch. Separate from `cfg` so an operator can
+    /// close the door on a running server without restarting it and dropping
+    /// everyone's connection.
+    pub locked: std::sync::atomic::AtomicBool,
+}
+
+impl RelayState {
+    pub fn is_locked(&self) -> bool {
+        self.locked.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn set_locked(&self, locked: bool) {
+        self.locked
+            .store(locked, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 pub type Shared = Arc<RelayState>;
@@ -68,6 +83,7 @@ pub async fn start(data_dir: &Path, cfg: RelayConfig) -> Result<(RelayHandle, Sh
     }
     let (tx, _) = broadcast::channel(512);
     let st: Shared = Arc::new(RelayState {
+        locked: std::sync::atomic::AtomicBool::new(cfg.locked),
         cfg: cfg.clone(),
         db,
         keys,
@@ -382,6 +398,12 @@ fn handle_event(st: &RelayState, ctx: &mut ConnCtx, ev: Event) -> Vec<Value> {
         let now = menhir_core::now();
         if ev.created_at.abs_diff(now) > AUTH_FRESHNESS_SECS {
             return ok(false, "invalid: redemption event is not fresh".into());
+        }
+        if st.is_locked() {
+            return ok(
+                false,
+                "restricted: this server is not accepting new members".into(),
+            );
         }
         return match st.db.invite_redeem(ev.content.trim()) {
             Ok(Ok(())) => {

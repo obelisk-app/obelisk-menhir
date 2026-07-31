@@ -19,6 +19,11 @@ pub struct RelayConfig {
     pub operator_pubkey: Option<String>,
     /// Maximum accepted content length in bytes — text channels only.
     pub max_content_len: usize,
+    /// When true, invite codes stop being accepted: already-whitelisted people
+    /// keep their access, but nobody new can let themselves in. The operator's
+    /// "close the door" switch once a community is assembled.
+    #[serde(default)]
+    pub locked: bool,
 }
 
 impl Default for RelayConfig {
@@ -30,6 +35,7 @@ impl Default for RelayConfig {
             open: false,
             operator_pubkey: None,
             max_content_len: 4096,
+            locked: false,
         }
     }
 }

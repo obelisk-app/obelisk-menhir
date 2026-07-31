@@ -25,6 +25,8 @@ pub fn run() {
             host::host_start,
             host::host_stop,
             host::host_invite_create,
+            host::host_invite_revoke,
+            host::host_set_locked,
             host::host_whitelist_add,
             host::host_whitelist_remove,
             host::bridge_open,
@@ -33,9 +35,22 @@ pub fn run() {
         .expect("error while running Obelisk Menhir");
 }
 
+/// One outstanding invite code, for the operator's invite list.
+#[derive(Clone, Default, serde::Serialize)]
+pub struct InviteRow {
+    pub code: String,
+    pub uses: u32,
+    pub max_uses: u32,
+    pub expires_at: Option<u64>,
+}
+
 /// Snapshot of the local node, shown in the Host panel.
 #[derive(Clone, Default, serde::Serialize)]
 pub struct HostStatus {
+    /// True when the server has stopped accepting invite redemptions.
+    pub locked: bool,
+    /// Invite codes still outstanding.
+    pub invites: Vec<InviteRow>,
     /// False on Android/iOS — hosting is a desktop feature.
     pub supported: bool,
     pub running: bool,
