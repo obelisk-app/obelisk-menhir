@@ -3280,7 +3280,7 @@ dependencies = [
 
 [[package]]
 name = "menhir-app"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "android_logger",
  "anyhow",
@@ -3304,7 +3304,7 @@ dependencies = [
 
 [[package]]
 name = "menhir-core"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "bech32",
@@ -3325,7 +3325,7 @@ dependencies = [
 
 [[package]]
 name = "menhir-relay"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "axum",
