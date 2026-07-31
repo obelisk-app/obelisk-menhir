@@ -16,6 +16,7 @@ pub fn run() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             host::setup(app);
             Ok(())

@@ -7,6 +7,7 @@ import * as nip19 from 'nostr-tools/nip19';
 import { NsecSigner, Nip07Signer, RemoteSigner, restoreSigner } from './signer.js';
 import { renderQR, startScanner } from './qr.js';
 import * as store from './store.js';
+import * as notify from './notify.js';
 import { APP_VERSION } from './version.js';
 
 // ---------- helpers ----------
@@ -170,6 +171,10 @@ let messages = new Map();
 let channelAdmins = new Map();
 /** channelId -> [{pubkey, role}], from 39002 + 39001. */
 let channelMembers = new Map();
+/** channelId -> unix seconds of the newest message the reader has seen. */
+let readState = {};
+/** True once a channel's backfill has finished, so history is not "new". */
+let liveChannels = new Set();
 
 let reconnectTimer = null;
 let reconnectAttempt = 0;
@@ -248,6 +253,8 @@ async function connectTo(entry, isReconnect = false) {
     // Paint from cache first so there is something to look at immediately.
     channels = new Map(store.loadChannels(entry.url).map((c) => [c.id, c]));
     profiles = new Map(Object.entries(store.loadProfiles(entry.url)));
+    readState = store.loadReadState(entry.url);
+    liveChannels = new Set();
     messages = new Map();
     channelAdmins = new Map();
     channelMembers = new Map();
@@ -285,6 +292,9 @@ async function connectTo(entry, isReconnect = false) {
     openMetaSubscriptions(c);
     if (activeChannel) subscribeChannel(activeChannel);
     maybeAdoptRelayName(entry, wsUrl);
+    // Asked here rather than at launch: a permission prompt before you have
+    // even joined a server is a prompt with no context, and gets denied.
+    notify.ensurePermission();
   };
 
   c.onauthchallenge = async (challenge) => {
@@ -438,6 +448,38 @@ function openMetaSubscriptions(c) {
 
 // ---------- channels & messages ----------
 
+/** Unread count for a channel, from the local read mark. */
+function unreadCount(id) {
+  return store.unreadIn(messages.get(id) || [], readState[id] || 0, signer?.pubkey);
+}
+
+/** Total unread across a server, for the rail badge. */
+function unreadForServer() {
+  let n = 0;
+  for (const id of channels.keys()) n += unreadCount(id);
+  return n;
+}
+
+/**
+ * Mark a channel read up to its newest message.
+ *
+ * Only counts when the window is actually focused — marking read while the
+ * app sits in the background behind another window would quietly swallow
+ * everything that arrived.
+ */
+function markRead(id, force = false) {
+  if (!id || !activeServer) return;
+  if (!force && document.visibilityState !== 'visible') return;
+  const list = messages.get(id) || [];
+  if (!list.length) return;
+  const newest = list[list.length - 1].created_at;
+  if ((readState[id] || 0) >= newest) return;
+  readState[id] = newest;
+  store.saveReadState(activeServer.url, readState);
+  renderChannels();
+  renderRail();
+}
+
 function isAdminOf(channelId) {
   return !!signer && !!channelAdmins.get(channelId)?.has(signer.pubkey);
 }
@@ -457,6 +499,7 @@ function selectChannel(id) {
   // Cache first: the channel is readable before the relay says anything.
   if (!messages.has(id)) messages.set(id, store.loadMessages(activeServer.url, id));
   renderMessages(id);
+  markRead(id);
 
   if (conn) subscribeChannel(id);
 }
@@ -475,7 +518,9 @@ function subscribeChannel(id) {
     oneose: () => {
       ingest(id, batch);
       batch = [];
-      // Everything after EOSE is live: render as it lands.
+      // Everything after EOSE is live: render as it lands, and only from here
+      // is a message worth a notification — backfilled history is not news.
+      liveChannels.add(id);
       conn.subs.get(msgSubId).onevent = (ev) => ingest(id, [ev]);
     },
     onclosed: (msg) => setServerStatus('subscription closed: ' + msg, true),
@@ -490,7 +535,34 @@ function ingest(channelId, incoming) {
   if (merged.length === before.length) return; // nothing new
   messages.set(channelId, merged);
   store.saveMessages(activeServer.url, channelId, merged);
-  if (channelId === activeChannel) renderMessages(channelId);
+
+  const focused = document.visibilityState === 'visible';
+  const looking = channelId === activeChannel && focused;
+  if (looking) {
+    renderMessages(channelId);
+    markRead(channelId);
+  } else if (liveChannels.has(channelId)) {
+    announce(channelId, incoming);
+  }
+  renderChannels();
+  renderRail();
+}
+
+/** Tell the reader about messages they are not currently looking at. */
+function announce(channelId, incoming) {
+  if (!notify.canNotify()) return;
+  const fresh = incoming.filter(
+    (ev) => ev.pubkey !== signer?.pubkey && ev.created_at > (readState[channelId] || 0),
+  );
+  if (!fresh.length) return;
+  const ev = fresh[fresh.length - 1];
+  const who = profiles.get(ev.pubkey) || shortNpub(ev.pubkey);
+  const where = channels.get(channelId)?.name || channelId;
+  const server = activeServer?.label ? ` · ${activeServer.label}` : '';
+  const title = fresh.length > 1
+    ? `${fresh.length} new in #${where}${server}`
+    : `${who} in #${where}${server}`;
+  notify.notify(title, ev.content.slice(0, 180));
 }
 
 function clearChat(placeholder) {
@@ -587,6 +659,7 @@ function renderRail() {
     const label = entry.label || entry.url.replace(/^wss?:\/\//, '');
     btn.textContent = label[0].toUpperCase();
     btn.title = `${label}\n${entry.url}`;
+    if (entry === activeServer && unreadForServer() > 0) btn.classList.add('has-unread');
     btn.onclick = () => selectServer(entry);
     btn.oncontextmenu = (e) => { e.preventDefault(); openServerSettings(entry); };
     list.appendChild(btn);
@@ -598,8 +671,19 @@ function renderChannels() {
   list.innerHTML = '';
   for (const ch of [...channels.values()].sort((a, b) => a.id.localeCompare(b.id))) {
     const div = document.createElement('div');
-    div.className = 'channel-item' + (ch.id === activeChannel ? ' active' : '');
-    div.textContent = '#' + ch.name;
+    const n = unreadCount(ch.id);
+    div.className =
+      'channel-item' + (ch.id === activeChannel ? ' active' : '') + (n ? ' unread' : '');
+    const label = document.createElement('span');
+    label.className = 'channel-label';
+    label.textContent = '#' + ch.name;
+    div.appendChild(label);
+    if (n) {
+      const badge = document.createElement('span');
+      badge.className = 'badge';
+      badge.textContent = n > 99 ? '99+' : String(n);
+      div.appendChild(badge);
+    }
     div.title = ch.about || ch.id;
     div.onclick = () => selectChannel(ch.id);
     list.appendChild(div);
@@ -1357,9 +1441,12 @@ function wireApp() {
   trackKeyboard();
 
   // Mobile browsers kill pages without warning; flush pending cache writes.
+  // Coming back to the app catches up the read mark for whatever is on screen.
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'hidden') store.flushWrites();
+    else if (activeChannel) { renderMessages(activeChannel); markRead(activeChannel); }
   });
+  window.addEventListener('focus', () => { if (activeChannel) markRead(activeChannel); });
 }
 
 /**

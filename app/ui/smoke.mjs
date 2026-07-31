@@ -22,13 +22,24 @@ const bundle = fs.readFileSync(path.join(here, 'dist/bundle.js'), 'utf8');
 const failures = [];
 const check = (name, fn) => {
   try {
-    fn();
+    const r = fn();
+    if (r && typeof r.then === 'function') {
+      // Async checks are awaited by the caller via `pending`.
+      pending.push(
+        r.then(
+          () => console.log(`  ok    ${name}`),
+          (e) => { failures.push(`${name}: ${e.message}`); console.log(`  FAIL  ${name}: ${e.message}`); },
+        ),
+      );
+      return;
+    }
     console.log(`  ok    ${name}`);
   } catch (e) {
     failures.push(`${name}: ${e.message}`);
     console.log(`  FAIL  ${name}: ${e.message}`);
   }
 };
+const pending = [];
 
 const dom = new JSDOM(html, {
   runScripts: 'outside-only',
@@ -162,12 +173,48 @@ check('garbage input is rejected with a message', () => {
   if ($('add-server-error').classList.contains('hidden')) throw new Error('no error shown');
 });
 
+console.log('\nunread:');
+check('unread counts skip your own messages and anything already read', async () => {
+  const store = await import('./src/store.js');
+  const me = 'aa'.repeat(32);
+  const them = 'bb'.repeat(32);
+  const msgs = [
+    { id: '1', pubkey: them, created_at: 100, content: 'old' },
+    { id: '2', pubkey: me, created_at: 200, content: 'mine' },
+    { id: '3', pubkey: them, created_at: 300, content: 'new' },
+    { id: '4', pubkey: them, created_at: 400, content: 'newer' },
+  ];
+  const all = store.unreadIn(msgs, 0, me);
+  if (all !== 3) throw new Error(`expected 3 unread from others, got ${all}`);
+  const some = store.unreadIn(msgs, 200, me);
+  if (some !== 2) throw new Error(`expected 2 after the read mark, got ${some}`);
+  const none = store.unreadIn(msgs, 400, me);
+  if (none !== 0) throw new Error(`expected 0 when caught up, got ${none}`);
+  if (store.unreadIn([], 0, me) !== 0) throw new Error('empty channel must be 0');
+});
+check('merging is idempotent and keeps time order', async () => {
+  const store = await import('./src/store.js');
+  const a = [{ id: 'b', created_at: 200 }, { id: 'a', created_at: 100 }];
+  const merged = store.mergeMessages(a, [{ id: 'a', created_at: 100 }, { id: 'c', created_at: 150 }]);
+  if (merged.length !== 3) throw new Error(`duplicate not collapsed: ${merged.length}`);
+  const times = merged.map((m) => m.created_at);
+  if (String(times) !== '100,150,200') throw new Error('not sorted by time: ' + times);
+});
+check('resume point sits behind the newest message', async () => {
+  const store = await import('./src/store.js');
+  if (store.resumeSince([]) !== undefined) throw new Error('empty cache must fetch history');
+  const since = store.resumeSince([{ created_at: 1000 }]);
+  if (!(since < 1000)) throw new Error('resume must overlap, got ' + since);
+});
+
 console.log('\nqr:');
 check('the share-QR path runs', () => {
   $('server-qr-btn').onclick();
   if ($('qr-modal').classList.contains('hidden')) throw new Error('qr modal did not open');
   if (!$('qr-text').textContent.includes('obelisk://join')) throw new Error('no share link rendered');
 });
+
+await Promise.all(pending);
 
 console.log('');
 // jsdom keeps timers (reconnect backoff, rAF) alive, so exit explicitly

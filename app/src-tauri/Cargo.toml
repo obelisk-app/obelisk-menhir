@@ -27,6 +27,9 @@ anyhow = "1"
 # in the dependency graph, and *panics* on first use. A panic inside a Tauri
 # command never resolves its promise, so the UI just hangs — see run().
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+# Unread badges are only half of it: people need to be told when they are
+# spoken to. Works on desktop and Android from the same call.
+tauri-plugin-notification = "2"
 
 # Hosting is desktop-only (Android would kill a long-running server anyway),
 # so the relay, the managed `tor` process, and the Nostr core live here.

@@ -118,6 +118,36 @@ export function saveChannels(serverUrl, channels) {
   write(`chans/${serverKey(serverUrl)}`, channels);
 }
 
+// ---------- read state ----------
+//
+// One timestamp per channel: everything at or before it has been seen. Kept
+// per device deliberately — syncing read state across devices needs encrypted
+// per-user storage on the relay, which is a bigger piece of work than this.
+
+export function loadReadState(serverUrl) {
+  const obj = read(`read/${serverKey(serverUrl)}`, {});
+  return obj && typeof obj === 'object' ? obj : {};
+}
+
+export function saveReadState(serverUrl, readState) {
+  write(`read/${serverKey(serverUrl)}`, readState);
+}
+
+/**
+ * Messages the reader has not seen: newer than the mark, and not their own —
+ * your own message arriving back from the relay is not news.
+ */
+export function unreadIn(messages, lastReadAt, myPubkey) {
+  if (!messages?.length) return 0;
+  let n = 0;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const ev = messages[i];
+    if (ev.created_at <= lastReadAt) break;
+    if (ev.pubkey !== myPubkey) n++;
+  }
+  return n;
+}
+
 // ---------- profiles ----------
 
 export function loadProfiles(serverUrl) {
@@ -136,7 +166,13 @@ export function forgetServer(serverUrl) {
   for (let i = 0; i < localStorage.length; i++) {
     const k = localStorage.key(i);
     if (k?.startsWith(PREFIX) && k.includes(`/${key}/`)) doomed.push(k);
-    else if (k === `${PREFIX}chans/${key}` || k === `${PREFIX}profiles/${key}`) doomed.push(k);
+    else if (
+      k === `${PREFIX}chans/${key}` ||
+      k === `${PREFIX}profiles/${key}` ||
+      k === `${PREFIX}read/${key}`
+    ) {
+      doomed.push(k);
+    }
   }
   for (const k of doomed) localStorage.removeItem(k);
 }

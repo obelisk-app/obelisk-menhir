@@ -1,1 +1,1 @@
-{}
+{"default":{"identifier":"default","description":"Core webview access plus notifications, so people are told when they are spoken to.","local":true,"windows":["main"],"permissions":["core:default","notification:default"]}}
