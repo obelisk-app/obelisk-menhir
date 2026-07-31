@@ -3041,7 +3041,7 @@ dependencies = [
 
 [[package]]
 name = "menhir-app"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "arti-client",
@@ -3060,7 +3060,7 @@ dependencies = [
 
 [[package]]
 name = "menhir-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "bech32",
@@ -3080,7 +3080,7 @@ dependencies = [
 
 [[package]]
 name = "menhir-relay"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "axum",
