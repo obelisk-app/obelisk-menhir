@@ -988,14 +988,19 @@ async function refreshHostPanel() {
     const st = await tauriInvoke('host_status');
     // Tor missing is a blocker, not a footnote: without it the server exists
     // only on this machine. Say so before the start button, not after.
-    $('host-tor-warning').classList.toggle('hidden', st.tor_available);
-    $('host-form').classList.toggle('hidden', !st.tor_available);
+    // Tor missing only blocks when Tor is the only route chosen — a LAN
+    // server is a legitimate thing to run without it.
+    const needsTor = $('host-use-tor').checked && !$('host-clearnet').checked;
+    $('host-tor-warning').classList.toggle('hidden', st.tor_available || !needsTor);
+    $('host-form').classList.toggle('hidden', !st.tor_available && needsTor);
 
     if (st.running) {
       hide($('host-stopped'));
       show($('host-running'));
       setText($('host-state'), st.tor_state);
-      setText($('host-onion'), st.onion ? 'ws://' + st.onion : '(no Tor — local only)');
+      setText($('host-onion'), st.onion ? 'ws://' + st.onion : '(not published through Tor)');
+      $('host-lan-row').classList.toggle('hidden', !st.lan_url);
+      if (st.lan_url) setText($('host-lan'), st.lan_url);
       setText($('host-share'), st.share_link || st.relay_url || '—');
 
       $('host-locked').checked = !!st.locked;
@@ -1370,6 +1375,8 @@ function wireApp() {
     hostPollTimer = setInterval(refreshHostPanel, 3000);
   };
   $('host-recheck-btn').onclick = refreshHostPanel;
+  $('host-use-tor').onchange = refreshHostPanel;
+  $('host-clearnet').onchange = refreshHostPanel;
   $('host-start-btn').onclick = async () => {
     hostError(null);
     const btn = $('host-start-btn');
@@ -1380,6 +1387,7 @@ function wireApp() {
         name: $('host-name').value.trim() || 'My Menhir',
         operatorNpub: nip19.npubEncode(signer.pubkey),
         useTor: $('host-use-tor').checked,
+        clearnet: $('host-clearnet').checked,
       });
       await refreshHostPanel();
     } catch (e) {

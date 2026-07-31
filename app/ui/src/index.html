@@ -267,7 +267,8 @@
         </div>
         <div id="host-form">
           <input id="host-name" placeholder="Server name" value="My Menhir" />
-          <label class="check"><input type="checkbox" id="host-use-tor" checked /> Publish through Tor (required for anyone else to reach you)</label>
+          <label class="check"><input type="checkbox" id="host-use-tor" checked /> <span>Publish through Tor<br /><span class="small muted">A permanent onion address, reachable from anywhere. No domain or port forwarding.</span></span></label>
+          <label class="check"><input type="checkbox" id="host-clearnet" /> <span>Also listen on my network<br /><span class="small muted">For a LAN, or behind a reverse proxy terminating TLS for your own domain. Plain ws:// over a hostile network is readable.</span></span></label>
           <button id="host-start-btn" class="pill primary">Start hosting</button>
         </div>
       </div>
@@ -275,6 +276,7 @@
       <div id="host-running" class="hidden">
         <div class="kv"><span>Status</span><b id="host-state">—</b></div>
         <div class="kv"><span>Onion address</span><code id="host-onion" class="block-code">—</code></div>
+        <div class="kv hidden" id="host-lan-row"><span>On your network</span><code id="host-lan" class="block-code">—</code></div>
         <div class="kv"><span>Share link</span><code id="host-share" class="block-code">—</code></div>
         <div class="row gap">
           <button id="host-share-qr" class="pill primary">▦ Show QR</button>

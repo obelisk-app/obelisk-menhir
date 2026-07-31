@@ -16,7 +16,7 @@ This is the MVP implementation of the [Obelisk Desktop Tor Node spec](docs/tor-d
 | Piece | What it is |
 |---|---|
 | **Obelisk Menhir app** (`app/`) | Tauri 2 desktop + Android app. Chat client on every platform; on desktop it also embeds the relay and manages Tor (the *node manager*). |
-| **`menhir-relay`** (`crates/menhir-relay/`) | Standalone text-only NIP-29-lite Nostr relay: NIP-42 auth, npub whitelist, invite codes, SQLite storage, loopback-only listener with an optional Tor onion service. Concepts borrowed from [obelisk-relay](https://github.com/obelisk-app/obelisk-relay), rebuilt small. |
+| **`menhir-relay`** (`crates/menhir-relay/`) | Standalone text-only NIP-29-lite Nostr relay: NIP-42 auth, npub whitelist, invite codes, SQLite storage; loopback by default, reachable over a Tor onion service, a LAN, or your own domain behind TLS. Concepts borrowed from [obelisk-relay](https://github.com/obelisk-app/obelisk-relay), rebuilt small. |
 | **`menhir`** (`crates/menhir-cli/`) | Terminal client + relay admin, built for AI agents and operators: `--json` output everywhere, keys via env vars, `.onion` support through SOCKS5. |
 | **`menhir-core`** (`crates/menhir-core/`) | Shared Nostr protocol core: events, schnorr signatures, NIP-19, filters, relay client. |
 
@@ -24,9 +24,9 @@ This is the MVP implementation of the [Obelisk Desktop Tor Node spec](docs/tor-d
 
 ### Host a server (desktop app)
 
-1. Install Tor once: `brew install tor` (macOS) / `apt install tor` (Linux). The app refuses to start hosting without it and shows you the command — a loopback-only server is no use for chatting with anyone else.
+1. Install Tor once: `brew install tor` (macOS) / `apt install tor` (Linux). Only needed for the onion route — a network-only server does not require it, and the app tells you which you are missing.
 2. Open Obelisk Menhir, log in (extension, remote signer, nsec, or a fresh key).
-3. Press **⌂ Host a server** → **Start hosting**.
+3. Press **⌂ Host a server**, choose how to be reachable (Tor, your network, or both) → **Start hosting**.
 4. Tor bootstraps and shows your permanent onion address.
 5. Press **Create invite** → **Show QR**, and let a friend scan it.
 6. Keep the app running — your computer *is* the server.
@@ -56,7 +56,10 @@ menhir-relay whitelist add npub1…
 menhir-relay info
 ```
 
-The relay always listens on loopback only. Tor is the public ingress.
+By default the relay listens on loopback only and Tor is the public ingress.
+Add `--clearnet` to also bind every interface — for a LAN, or behind a reverse
+proxy terminating TLS for your own domain. The three routes coexist; the invite
+link carries whichever address you share.
 
 ### Terminal client (humans and AI agents)
 
@@ -119,6 +122,12 @@ macOS note: install prerequisites with `brew install rust node` plus Xcode comma
 - **Text only**: the relay rejects every other kind and caps content at 4 KB. No media, no formatting — rendered as plain text.
 - **Server isolation**: the client binds one relay at a time; events from different servers never mix.
 - **Tor everywhere**: desktop drives the system `tor` and publishes your onion service; Android embeds [arti](https://gitlab.torproject.org/tpo/core/arti) (Tor in Rust) in-process, so onion servers work on a phone with nothing to install. Either way a loopback bridge fronts it, so the webview dials `.onion` like any other host.
+
+## Where this is going
+
+[ROADMAP.md](ROADMAP.md) — what the MVP still needs, and the order features are
+being ported from [obelisk](https://github.com/obelisk-app/obelisk), with the
+reasoning for what does and does not transfer to a Tor-hosted server.
 
 ## Repo layout
 

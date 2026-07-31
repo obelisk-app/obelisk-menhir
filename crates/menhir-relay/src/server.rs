@@ -73,7 +73,11 @@ impl RelayHandle {
     }
 }
 
-/// Start the relay on 127.0.0.1 (loopback only — Tor is the public ingress).
+/// Start the relay.
+///
+/// Loopback only by default — Tor is the intended public ingress, and binding
+/// nowhere else means the relay cannot be reached except through it. Set
+/// `cfg.bind_all` to serve a LAN or sit behind a TLS-terminating proxy.
 /// `cfg.port` of 0 picks an ephemeral port; the actual port is on the handle.
 pub async fn start(data_dir: &Path, cfg: RelayConfig) -> Result<(RelayHandle, Shared)> {
     let keys = load_or_create_identity(data_dir)?;
@@ -91,13 +95,30 @@ pub async fn start(data_dir: &Path, cfg: RelayConfig) -> Result<(RelayHandle, Sh
     });
 
     let app = Router::new().route("/", get(root)).with_state(st.clone());
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", cfg.port)).await?;
+    let host = if cfg.bind_all { "0.0.0.0" } else { "127.0.0.1" };
+    let listener = tokio::net::TcpListener::bind((host, cfg.port)).await?;
     let port = listener.local_addr()?.port();
     let task = tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
-    tracing::info!(port, name = %cfg.name, open = cfg.open, "menhir relay listening on 127.0.0.1");
+    tracing::info!(
+        port,
+        bind = host,
+        name = %cfg.name,
+        open = cfg.open,
+        "menhir relay listening"
+    );
     Ok((RelayHandle { port, task }, st))
+}
+
+/// This machine's address on the local network, or None when offline.
+///
+/// Found by asking the OS which source address it would use to reach a public
+/// address — no packet is sent, UDP connect only sets the socket's peer.
+pub fn local_ip() -> Option<std::net::IpAddr> {
+    let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    sock.connect("1.1.1.1:80").ok()?;
+    sock.local_addr().ok().map(|a| a.ip())
 }
 
 async fn root(State(st): State<Shared>, req: Request) -> Response {

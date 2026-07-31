@@ -100,8 +100,9 @@ pub async fn host_start(
     name: String,
     operator_npub: String,
     use_tor: bool,
+    clearnet: bool,
 ) -> Result<HostStatus, String> {
-    let _ = (name, operator_npub, use_tor);
+    let _ = (name, operator_npub, use_tor, clearnet);
     Err(UNSUPPORTED.into())
 }
 

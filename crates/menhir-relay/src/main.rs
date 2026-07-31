@@ -41,6 +41,10 @@ enum Cmd {
         /// Start Tor and expose the relay as a persistent onion service.
         #[arg(long)]
         tor: bool,
+        /// Also listen on every interface, not just loopback — for a LAN, or
+        /// behind a reverse proxy terminating TLS for a real domain.
+        #[arg(long)]
+        clearnet: bool,
         /// SOCKS port for the managed Tor (0 disables outbound SOCKS).
         #[arg(long, default_value_t = 39050)]
         socks_port: u16,
@@ -97,6 +101,7 @@ async fn main() -> Result<()> {
             open,
             operator,
             tor: with_tor,
+            clearnet,
             socks_port,
         } => {
             let mut cfg = load_config(&data_dir)?;
@@ -109,13 +114,23 @@ async fn main() -> Result<()> {
             if open {
                 cfg.open = true;
             }
+            if clearnet {
+                cfg.bind_all = true;
+            }
             if let Some(op) = operator {
                 cfg.operator_pubkey = Some(menhir_core::keys::pubkey_to_hex(&op)?);
             }
             save_config(&data_dir, &cfg)?;
 
             let (handle, st) = server::start(&data_dir, cfg.clone()).await?;
-            println!("relay:   ws://127.0.0.1:{}", handle.port);
+            if cfg.bind_all {
+                println!("relay:   ws://0.0.0.0:{} (every interface)", handle.port);
+                if let Some(ip) = menhir_relay::server::local_ip() {
+                    println!("lan:     ws://{ip}:{}", handle.port);
+                }
+            } else {
+                println!("relay:   ws://127.0.0.1:{}", handle.port);
+            }
             println!("name:    {}", cfg.name);
             println!(
                 "pubkey:  {}",

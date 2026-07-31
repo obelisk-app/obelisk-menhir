@@ -24,6 +24,15 @@ pub struct RelayConfig {
     /// "close the door" switch once a community is assembled.
     #[serde(default)]
     pub locked: bool,
+    /// Listen on every interface instead of loopback only.
+    ///
+    /// Off by default: Tor is the intended ingress and loopback keeps the
+    /// relay unreachable except through it. Turn it on to serve a LAN, or to
+    /// sit behind a reverse proxy terminating TLS for a real domain — both
+    /// are legitimate, both mean the relay is exposed to whatever can route
+    /// to it, so the whitelist becomes the only thing standing there.
+    #[serde(default)]
+    pub bind_all: bool,
 }
 
 impl Default for RelayConfig {
@@ -36,6 +45,7 @@ impl Default for RelayConfig {
             operator_pubkey: None,
             max_content_len: 4096,
             locked: false,
+            bind_all: false,
         }
     }
 }

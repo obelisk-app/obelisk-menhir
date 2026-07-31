@@ -27,6 +27,8 @@ pub struct NodeInner {
     /// Live relay state, kept so the door can be locked without a restart.
     relay_state: Option<server::Shared>,
     relay_port: u16,
+    /// Whether the running relay is listening beyond loopback.
+    bind_all: bool,
     tor: Option<tor::TorHandle>,
     onion: Option<String>,
     name: String,
@@ -102,6 +104,11 @@ fn status_of(inner: &NodeInner, dir: &PathBuf) -> HostStatus {
             "local only (Tor not installed)".into()
         },
         whitelist: if running { whitelist_npubs(dir) } else { vec![] },
+        lan_url: if running && inner.bind_all {
+            server::local_ip().map(|ip| format!("ws://{ip}:{}", inner.relay_port))
+        } else {
+            None
+        },
         locked: inner.relay_state.as_ref().map(|st| st.is_locked()).unwrap_or(false),
         invites: if running { invite_rows(dir) } else { vec![] },
     }
@@ -120,6 +127,7 @@ pub async fn host_start(
     name: String,
     operator_npub: String,
     use_tor: bool,
+    clearnet: bool,
 ) -> Result<HostStatus, String> {
     let dir = host_dir(&app)?;
     let mut inner = state.0.lock().await;
@@ -129,14 +137,20 @@ pub async fn host_start(
 
     // Refuse up front rather than starting a relay nobody else can reach: a
     // loopback-only server is useless for chatting with other people.
-    if use_tor && !tor::tor_available() {
+    if use_tor && !clearnet && !tor::tor_available() {
         return Err(TOR_MISSING.to_string());
+    }
+    if !use_tor && !clearnet {
+        return Err("pick at least one way to be reachable: Tor, your local network, or both. \
+                    A loopback-only server can only talk to this computer."
+            .to_string());
     }
 
     let operator = pubkey_to_hex(&operator_npub).map_err(|e| e.to_string())?;
     let mut cfg = load_config(&dir).map_err(|e| e.to_string())?;
     cfg.name = if name.trim().is_empty() { "My Menhir".into() } else { name.trim().to_string() };
     cfg.operator_pubkey = Some(operator);
+    cfg.bind_all = clearnet;
     save_config(&dir, &cfg).map_err(|e| e.to_string())?;
 
     // The configured port may be taken by another process — fall back to ephemeral.
@@ -149,6 +163,7 @@ pub async fn host_start(
         }
     };
     inner.relay_port = handle.port;
+    inner.bind_all = cfg.bind_all;
     inner.relay = Some(handle);
     inner.relay_state = Some(relay_state);
     inner.name = cfg.name.clone();

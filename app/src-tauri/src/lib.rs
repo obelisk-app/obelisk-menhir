@@ -50,6 +50,8 @@ pub struct InviteRow {
 pub struct HostStatus {
     /// True when the server has stopped accepting invite redemptions.
     pub locked: bool,
+    /// Address on the local network, when listening beyond loopback.
+    pub lan_url: Option<String>,
     /// Invite codes still outstanding.
     pub invites: Vec<InviteRow>,
     /// False on Android/iOS — hosting is a desktop feature.
