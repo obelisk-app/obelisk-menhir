@@ -14,5 +14,5 @@ tor-rtcompat = { version = "0.44", default-features = false, features = ["tokio"
 rusqlite = { version = "0.37", features = ["bundled"] }
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
-rustls = { version = "0.23", features = ["ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

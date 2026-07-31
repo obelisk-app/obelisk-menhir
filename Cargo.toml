@@ -9,7 +9,7 @@ members = [
 # it cross-compiles for Android with its own lockfile and profile settings.
 
 [workspace.package]
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/obelisk-app/obelisk-menhir"

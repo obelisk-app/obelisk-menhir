@@ -4,7 +4,7 @@
 
 [package]
 name = "menhir-app"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 license = "MIT"
 description = "Obelisk Menhir — sovereign text channels over Nostr, with one-click Tor hosting"
@@ -26,7 +26,7 @@ anyhow = "1"
 # rustls 0.23 refuses to pick a crypto backend when more than one is present
 # in the dependency graph, and *panics* on first use. A panic inside a Tauri
 # command never resolves its promise, so the UI just hangs — see run().
-rustls = { version = "0.23", features = ["ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 
 # Hosting is desktop-only (Android would kill a long-running server anyway),
 # so the relay, the managed `tor` process, and the Nostr core live here.

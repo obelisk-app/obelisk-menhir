@@ -65,7 +65,11 @@ class RelayConn {
     return new Promise((resolve, reject) => {
       const ws = new WebSocket(this.wsUrl);
       this.ws = ws;
-      const failTimer = setTimeout(() => { ws.close(); reject(new Error('connection timed out')); }, 20000);
+      // The socket to the bridge opens instantly, but the bridge then builds a
+      // Tor circuit to the onion behind it — a cold one can take the better
+      // part of a minute. Timing out at 20s there just restarts the wait.
+      const budget = this.displayUrl.includes('.onion') ? 120000 : 20000;
+      const failTimer = setTimeout(() => { ws.close(); reject(new Error('connection timed out')); }, budget);
       ws.onopen = () => { clearTimeout(failTimer); resolve(); };
       ws.onerror = () => { clearTimeout(failTimer); reject(new Error('could not reach the relay')); };
       ws.onclose = () => { if (!this.dead) { this.dead = true; this.onclose?.(); } };
